@@ -77,8 +77,6 @@ docker compose exec panel web-proxy-panelctl users
 
 ## Сборка
 
-Сборка идёт на Linux-хосте с Docker и buildx (достаточно 1 ГБ ОЗУ и swap). Источник истины — локальная копия репозитория; на сборочный хост её переносит `scripts/sync-to-build.ps1 -BuildHost <адрес>`. Перед публикацией `scripts/build.sh push` проверяет образы на закрытые ключи и на шаблоны из `scripts/scan-patterns.local` (ваши домены и IP; файл не коммитится).
-
 ```bash
 scripts/build.sh build          # все образы по очереди
 tests/smoke-relay.sh mejiufaro/wpp-relay:2.3.6-2
