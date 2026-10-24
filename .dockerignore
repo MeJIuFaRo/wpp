@@ -1,0 +1,7 @@
+**
+!src/**
+!images/**
+!downloads/**
+!upstream/web-panel-proxy/panel-logo.png
+**/__pycache__
+**/*.pyc

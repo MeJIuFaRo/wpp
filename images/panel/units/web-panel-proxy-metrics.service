@@ -1,0 +1,7 @@
+[Unit]
+Description=WEB PANEL PROXY VPS metrics
+
+[Service]
+Type=oneshot
+ExecStart=python3 /opt/tproxy-panel/wpp_metrics.py collect
+StandardOutput=null

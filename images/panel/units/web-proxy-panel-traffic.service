@@ -1,0 +1,8 @@
+[Unit]
+Description=WEB PANEL PROXY traffic collector
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/web-proxy-panel/panel.env
+ExecStart=/usr/local/sbin/web-proxy-panelctl traffic
+StandardOutput=null

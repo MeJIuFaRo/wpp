@@ -1,0 +1,13 @@
+[Unit]
+Description=WEB PANEL PROXY panel
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/web-proxy-panel/panel.env
+WorkingDirectory=/opt/tproxy-panel
+ExecStart=/usr/local/sbin/wpp-panel-start
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

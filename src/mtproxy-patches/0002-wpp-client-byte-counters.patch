@@ -1,0 +1,118 @@
+diff -ruN a/mtproto/mtproto-proxy.c b/mtproto/mtproto-proxy.c
+--- a/mtproto/mtproto-proxy.c	2026-08-04 17:48:49.000000000 +0300
++++ b/mtproto/mtproto-proxy.c	2026-10-23 20:48:03.000000000 +0300
+@@ -487,6 +487,8 @@
+   UPD (conn.tcp_writev_calls);
+   UPD (conn.tcp_writev_intr);
+   UPD (conn.tcp_writev_bytes);
++  UPD (conn.client_read_bytes);
++  UPD (conn.client_write_bytes);
+   UPD (conn.accept_calls_failed);
+   UPD (conn.accept_nonblock_set_failed);
+   UPD (conn.accept_rate_limit_failed);
+@@ -645,6 +647,8 @@
+ 	     "http_qps\t%.6f\n"
+ 	     "proxy_mode\t%d\n"
+ 	     "proxy_tag_set\t%d\n"
++	     "wpp_client_read_bytes\t%lld\n"
++	     "wpp_client_write_bytes\t%lld\n"
+ 	     "version\t" VERSION_STR " compiled at " __DATE__ " " __TIME__ " by gcc " __VERSION__ " "
+ #ifdef __LP64__
+ 	     "64-bit"
+@@ -710,7 +714,9 @@
+ 	     S(http_bad_headers),
+ 	     safe_div (S(http_queries), uptime),
+ 	     proxy_mode,
+-	     proxy_tag_set
++	     proxy_tag_set,
++	     S(conn.client_read_bytes),
++	     S(conn.client_write_bytes)
+   );
+ #undef S
+ #undef S1
+@@ -1954,6 +1960,7 @@
+   memcpy (&ct_http_server_mtfront, &ct_http_server, sizeof (conn_type_t));
+   memcpy (&ct_tcp_rpc_ext_server_mtfront, &ct_tcp_rpc_ext_server, sizeof (conn_type_t));
+   memcpy (&ct_tcp_rpc_server_mtfront, &ct_tcp_rpc_server, sizeof (conn_type_t));
++  wpp_client_conn_type = &ct_tcp_rpc_ext_server_mtfront;
+   memcpy (&ct_tcp_rpc_client_mtfront, &ct_tcp_rpc_client, sizeof (conn_type_t));
+   ct_http_server_mtfront.data_received = &mtfront_data_received;
+   ct_tcp_rpc_ext_server_mtfront.data_received = &mtfront_data_received;
+diff -ruN a/net/net-connections.c b/net/net-connections.c
+--- a/net/net-connections.c	2026-08-04 17:48:49.000000000 +0300
++++ b/net/net-connections.c	2026-10-23 20:47:29.000000000 +0300
+@@ -80,6 +80,8 @@
+ static int max_connection_fd = MAX_CONNECTIONS;
+ 
+ int active_special_connections, max_special_connections = MAX_CONNECTIONS;
++/* WPP: socket bytes of this connection type are counted as client traffic */
++conn_type_t *wpp_client_conn_type;
+ 
+ int special_listen_sockets;
+ 
+@@ -108,6 +110,7 @@
+ 
+ long long tcp_readv_calls, tcp_writev_calls, tcp_readv_intr, tcp_writev_intr;
+ long long tcp_readv_bytes, tcp_writev_bytes;
++long long client_read_bytes, client_write_bytes;
+ 
+ int free_later_size;
+ long long free_later_total;
+@@ -161,6 +164,8 @@
+   SB_SUM_ONE_LL (tcp_writev_calls);
+   SB_SUM_ONE_LL (tcp_writev_intr);
+   SB_SUM_ONE_LL (tcp_writev_bytes);
++  SB_SUM_ONE_LL (client_read_bytes);
++  SB_SUM_ONE_LL (client_write_bytes);
+   SB_SUM_ONE_I (free_later_size);
+   SB_SUM_ONE_LL (free_later_total);
+ 
+@@ -195,6 +200,8 @@
+   COLLECT_LL (tcp_writev_calls);
+   COLLECT_LL (tcp_writev_intr);
+   COLLECT_LL (tcp_writev_bytes);
++  COLLECT_LL (client_read_bytes);
++  COLLECT_LL (client_write_bytes);
+   COLLECT_LL (accept_calls_failed);
+   COLLECT_LL (accept_nonblock_set_failed);
+   COLLECT_LL (accept_rate_limit_failed);
+@@ -893,6 +900,9 @@
+     }
+ 
+     MODULE_STAT->tcp_readv_bytes += r;
++    if (wpp_client_conn_type && c->type == wpp_client_conn_type) {
++      MODULE_STAT->client_read_bytes += r;
++    }
+     struct msg_part *mp = 0;
+     assert (p == 1);
+     mp = new_msg_part (0, tcp_recv_buffers[p - 1]);
+@@ -991,6 +1001,9 @@
+     } else {
+       __sync_fetch_and_and (&c->flags, ~C_NOWR);
+       MODULE_STAT->tcp_writev_bytes += r;
++      if (wpp_client_conn_type && c->type == wpp_client_conn_type) {
++        MODULE_STAT->client_write_bytes += r;
++      }
+       c->eagain_count = 0;
+       t += r;
+     }
+diff -ruN a/net/net-connections.h b/net/net-connections.h
+--- a/net/net-connections.h	2026-08-04 17:48:49.000000000 +0300
++++ b/net/net-connections.h	2026-10-23 20:47:43.000000000 +0300
+@@ -315,6 +315,8 @@
+   long long tcp_writev_calls;
+   long long tcp_writev_intr;
+   long long tcp_writev_bytes;
++  long long client_read_bytes;
++  long long client_write_bytes;
+   long long accept_calls_failed;
+   long long accept_nonblock_set_failed;
+   long long accept_rate_limit_failed;
+@@ -439,6 +441,7 @@
+ void tcp_set_max_connections (int maxconn);
+ 
+ extern int max_special_connections, active_special_connections;
++extern conn_type_t *wpp_client_conn_type;
+ 
+ #define MAX_NAT_INFO_RULES	16
+ extern int nat_info_rules;

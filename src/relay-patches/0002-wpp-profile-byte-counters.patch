@@ -1,0 +1,197 @@
+diff -ruN a/internal/server/profile_bytes_test.go b/internal/server/profile_bytes_test.go
+--- a/internal/server/profile_bytes_test.go	1970-01-01 03:00:00.000000000 +0300
++++ b/internal/server/profile_bytes_test.go	2026-10-23 20:39:52.000000000 +0300
+@@ -0,0 +1,56 @@
++package server
++
++import (
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"regexp"
++	"strconv"
++	"testing"
++
++	"github.com/telegramdesktop/tproxy-server/internal/frame"
++)
++
++func TestMetricsCountBytesPerProfile(t *testing.T) {
++	backend := startEchoBackend(t)
++	app, _ := newConfiguredTestServer(t, backend, nil)
++	defer app.Shutdown()
++	hosted := httptest.NewServer(app.Handler())
++	defer hosted.Close()
++	admin := httptest.NewServer(app.AdminHandler())
++	defer admin.Close()
++
++	profile := app.manager.Profiles()[0]
++	bootstrap, err := app.manager.IssueBootstrap(&profile, "127.0.0.1")
++	if err != nil {
++		t.Fatal(err)
++	}
++	r := perform(t, hosted.Client(), apiRequest(t, "POST", hosted.URL+"/api/v1/session", bootstrap, frame.Encode(frame.Hello, 0, []byte{1})))
++	readResponse(t, r)
++	token := r.Header.Get("X-Session-Token")
++	payload := []byte("profile-counter-payload")
++	body := append(frame.Encode(frame.Open, 5, nil), frame.Encode(frame.Data, 5, payload)...)
++	req := apiRequest(t, "POST", hosted.URL+"/api/v1/up", token, body)
++	req.Header.Set("X-Up-Seq", "1")
++	r = perform(t, hosted.Client(), req)
++	readResponse(t, r)
++	if r.StatusCode != 204 {
++		t.Fatal(r.StatusCode)
++	}
++	pollForData(t, hosted.Client(), hosted.URL, token, "0", map[uint32][]byte{5: payload})
++
++	get, _ := http.NewRequest("GET", admin.URL+"/metrics", nil)
++	r = perform(t, admin.Client(), get)
++	metrics := string(readResponse(t, r))
++	for _, direction := range []string{"up", "down"} {
++		pattern := regexp.MustCompile(fmt.Sprintf(`(?m)^tproxy_profile_bytes_%s_total\{profile="%s"\} (\d+)$`,
++			direction, regexp.QuoteMeta(profile.Name)))
++		match := pattern.FindStringSubmatch(metrics)
++		if match == nil {
++			t.Fatalf("no %s counter for %q in:\n%s", direction, profile.Name, metrics)
++		}
++		if value, _ := strconv.Atoi(match[1]); value < len(payload) {
++			t.Fatalf("%s counter %d < %d", direction, value, len(payload))
++		}
++	}
++}
+diff -ruN a/internal/server/server.go b/internal/server/server.go
+--- a/internal/server/server.go	2026-10-23 20:44:01.476605189 +0300
++++ b/internal/server/server.go	2026-10-23 20:39:28.000000000 +0300
+@@ -806,8 +806,18 @@
+ 		metrics.StreamsOpened, metrics.StreamsRejected,
+ 		metrics.BackendDialFailures, metrics.BytesUp, metrics.BytesDown,
+ 		metrics.LimitHits)
++	for _, value := range s.manager.ProfileBytes() {
++		label := metricLabel.Replace(value.Name)
++		_, _ = fmt.Fprintf(w,
++			"tproxy_profile_bytes_up_total{profile=\"%s\"} %d\n"+
++				"tproxy_profile_bytes_down_total{profile=\"%s\"} %d\n",
++			label, value.Up, label, value.Down)
++	}
+ }
+ 
++// Prometheus text format label value escaping.
++var metricLabel = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
++
+ func (s *Server) setReadDeadline(w http.ResponseWriter) {
+ 	if controller := http.NewResponseController(w); controller != nil {
+ 		_ = controller.SetReadDeadline(time.Now().Add(s.bodyReadDeadline))
+diff -ruN a/internal/session/manager.go b/internal/session/manager.go
+--- a/internal/session/manager.go	2026-10-23 20:44:01.477605124 +0300
++++ b/internal/session/manager.go	2026-10-23 20:39:28.000000000 +0300
+@@ -7,6 +7,7 @@
+ 	"encoding/base64"
+ 	"errors"
+ 	"fmt"
++	"sort"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+@@ -56,6 +57,19 @@
+ 	LimitHits           uint64
+ }
+ 
++// Per-profile transferred bytes. Counters live while the profile is
++// configured; a profile removed by ReloadProfiles starts again from zero.
++type ProfileBytes struct {
++	Name string
++	Up   uint64
++	Down uint64
++}
++
++type profileCounter struct {
++	up   atomic.Uint64
++	down atomic.Uint64
++}
++
+ type Capacity struct {
+ 	Sessions             int
+ 	Streams              int
+@@ -81,6 +95,7 @@
+ 	streamRate           rateState
+ 	profileSessionRates  map[string]rateState
+ 	profileStreamRates   map[string]rateState
++	profileBytes         map[string]*profileCounter
+ 	streamsLive          int
+ 	backendDialsInFlight int
+ 	pendingGlobalCost    int64
+@@ -116,6 +131,7 @@
+ 		dialsPerProfile:     make(map[string]int),
+ 		profileSessionRates: make(map[string]rateState),
+ 		profileStreamRates:  make(map[string]rateState),
++		profileBytes:        make(map[string]*profileCounter),
+ 		stop:                make(chan struct{}),
+ 		done:                make(chan struct{}),
+ 	}
+@@ -146,6 +162,18 @@
+ 	}
+ 	m.mu.Lock()
+ 	m.config.Profiles = profiles
++	for name := range m.profileBytes {
++		kept := false
++		for i := range profiles {
++			if profiles[i].Name == name {
++				kept = true
++				break
++			}
++		}
++		if !kept {
++			delete(m.profileBytes, name)
++		}
++	}
+ 	for hash, entry := range m.bootstraps {
+ 		if !same(entry.profile) {
+ 			m.removeBootstrapLocked(hash, entry)
+@@ -284,6 +312,11 @@
+ 	limits := m.config.Limits
+ 	limits.MaxStreamsPerSession = profileLimits.MaxStreamsPerSession
+ 	limits.MaxPendingPerSession = profileLimits.MaxPendingPerSession
++	counter := m.profileBytes[entry.profile.Name]
++	if counter == nil {
++		counter = &profileCounter{}
++		m.profileBytes[entry.profile.Name] = counter
++	}
+ 	created := newSession(sessionOptions{
+ 		profile:       entry.profile,
+ 		clientIP:      clientIP,
+@@ -300,8 +333,14 @@
+ 			m.streamsRejected.Add(1)
+ 			m.limitHits.Add(1)
+ 		},
+-		onUp:   func(count int) { m.bytesUp.Add(uint64(count)) },
+-		onDown: func(count int) { m.bytesDown.Add(uint64(count)) },
++		onUp: func(count int) {
++			m.bytesUp.Add(uint64(count))
++			counter.up.Add(uint64(count))
++		},
++		onDown: func(count int) {
++			m.bytesDown.Add(uint64(count))
++			counter.down.Add(uint64(count))
++		},
+ 	})
+ 	m.sessions[sessionHash] = created
+ 	m.sessionsPerIP[clientIP]++
+@@ -377,6 +416,19 @@
+ 	}
+ }
+ 
++// ProfileBytes returns the counters of every profile that carried traffic,
++// sorted by name.
++func (m *Manager) ProfileBytes() []ProfileBytes {
++	m.mu.Lock()
++	result := make([]ProfileBytes, 0, len(m.profileBytes))
++	for name, counter := range m.profileBytes {
++		result = append(result, ProfileBytes{Name: name, Up: counter.up.Load(), Down: counter.down.Load()})
++	}
++	m.mu.Unlock()
++	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
++	return result
++}
++
+ func (m *Manager) Capacity() Capacity {
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()

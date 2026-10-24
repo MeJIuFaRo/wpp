@@ -1,0 +1,184 @@
+diff -ruN a/mtproto/mtproto-proxy.c b/mtproto/mtproto-proxy.c
+--- a/mtproto/mtproto-proxy.c	2026-10-23 23:52:32.997500337 +0300
++++ b/mtproto/mtproto-proxy.c	2026-10-23 23:51:01.000000000 +0300
+@@ -63,6 +63,10 @@
+ #include "common/tl-parse.h"
+ #include "engine/engine.h"
+ #include "engine/engine-net.h"
++#include "common/sha256.h"
++
++/* WPP: net/net-tcp-rpc-ext-server.c */
++int tcp_rpcs_get_ext_secret (int index, unsigned char secret[16]);
+ 
+ #ifndef COMMIT
+ #define COMMIT "unknown"
+@@ -402,6 +406,8 @@
+ 
+   long long ext_connections, ext_connections_created;
+   long long http_queries, http_bad_headers;
++
++  long long wpp_secret_bytes[WPP_MAX_SECRETS][2];
+ };
+ 
+ struct worker_stats *WStats, SumStats;
+@@ -455,6 +461,7 @@
+   UPD (http_queries); 
+   UPD (http_bad_headers);
+ #undef UPD
++  memcpy (S->wpp_secret_bytes, wpp_secret_bytes, sizeof (wpp_secret_bytes));
+   __sync_synchronize();
+   S->cnt++;
+   __sync_synchronize();
+@@ -530,6 +537,11 @@
+   UPD (http_queries); 
+   UPD (http_bad_headers);
+ #undef UPD
++  int i;
++  for (i = 0; i < WPP_MAX_SECRETS; i++) {
++    SumStats.wpp_secret_bytes[i][0] += W->wpp_secret_bytes[i][0];
++    SumStats.wpp_secret_bytes[i][1] += W->wpp_secret_bytes[i][1];
++  }
+ }
+ 
+ void update_local_stats (void) {
+@@ -718,6 +730,21 @@
+ 	     S(conn.client_read_bytes),
+ 	     S(conn.client_write_bytes)
+   );
++  // WPP: per-key client bytes, keyed by the first 8 bytes of SHA-256(key)
++  // so that the panel can match them to clients without exposing keys.
++  int i, keys = tcp_rpcs_get_ext_secret (-1, NULL);
++  for (i = 0; i < keys && i < WPP_MAX_SECRETS; i++) {
++    unsigned char key[16], digest[32];
++    tcp_rpcs_get_ext_secret (i, key);
++    sha256 (key, 16, digest);
++    sb_printf (sb,
++	       "wpp_key_%02x%02x%02x%02x%02x%02x%02x%02x_read_bytes\t%lld\n"
++	       "wpp_key_%02x%02x%02x%02x%02x%02x%02x%02x_write_bytes\t%lld\n",
++	       digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
++	       S(wpp_secret_bytes[i][0]),
++	       digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
++	       S(wpp_secret_bytes[i][1]));
++  }
+ #undef S
+ #undef S1
+ #undef SW
+diff -ruN a/net/net-connections.c b/net/net-connections.c
+--- a/net/net-connections.c	2026-10-23 23:52:32.998500310 +0300
++++ b/net/net-connections.c	2026-10-23 23:52:31.000000000 +0300
+@@ -82,6 +82,46 @@
+ int active_special_connections, max_special_connections = MAX_CONNECTIONS;
+ /* WPP: socket bytes of this connection type are counted as client traffic */
+ conn_type_t *wpp_client_conn_type;
++long long wpp_secret_bytes[WPP_MAX_SECRETS][2];
++
++static void wpp_move_pending (struct connection_info *conn, int id) {
++  int direction;
++  for (direction = 0; direction < 2; direction++) {
++    long long moved = __sync_fetch_and_and (&conn->wpp_pending_bytes[direction], 0LL);
++    if (moved) {
++      __sync_fetch_and_add (&wpp_secret_bytes[id - 1][direction], moved);
++    }
++  }
++}
++
++/* The key is found by the connection's CPU thread while the socket is served
++   by a network thread. Bytes read before that wait in wpp_pending_bytes; both
++   sides move them after publishing/re-reading the key, so none is lost. */
++void wpp_attribute_secret (struct connection_info *conn, int secret_index) {
++  if (secret_index < 0 || secret_index >= WPP_MAX_SECRETS) {
++    return;
++  }
++  if (__sync_bool_compare_and_swap (&conn->wpp_secret_id, 0, secret_index + 1)) {
++    wpp_move_pending (conn, secret_index + 1);
++  }
++}
++
++static inline void wpp_count_secret_bytes (struct socket_connection_info *c, int direction, int bytes) {
++  if (!c->conn) {
++    return;
++  }
++  struct connection_info *conn = CONN_INFO (c->conn);
++  int id = __sync_fetch_and_add (&conn->wpp_secret_id, 0);
++  if (id > 0 && id <= WPP_MAX_SECRETS) {
++    __sync_fetch_and_add (&wpp_secret_bytes[id - 1][direction], (long long) bytes);
++    return;
++  }
++  __sync_fetch_and_add (&conn->wpp_pending_bytes[direction], (long long) bytes);
++  id = __sync_fetch_and_add (&conn->wpp_secret_id, 0);
++  if (id > 0 && id <= WPP_MAX_SECRETS) {
++    wpp_move_pending (conn, id);
++  }
++}
+ 
+ int special_listen_sockets;
+ 
+@@ -902,6 +942,7 @@
+     MODULE_STAT->tcp_readv_bytes += r;
+     if (wpp_client_conn_type && c->type == wpp_client_conn_type) {
+       MODULE_STAT->client_read_bytes += r;
++      wpp_count_secret_bytes (c, 0, r);
+     }
+     struct msg_part *mp = 0;
+     assert (p == 1);
+@@ -1003,6 +1044,7 @@
+       MODULE_STAT->tcp_writev_bytes += r;
+       if (wpp_client_conn_type && c->type == wpp_client_conn_type) {
+         MODULE_STAT->client_write_bytes += r;
++        wpp_count_secret_bytes (c, 1, r);
+       }
+       c->eagain_count = 0;
+       t += r;
+diff -ruN a/net/net-connections.h b/net/net-connections.h
+--- a/net/net-connections.h	2026-10-23 23:52:32.998500310 +0300
++++ b/net/net-connections.h	2026-10-23 23:52:15.000000000 +0300
+@@ -252,6 +252,8 @@
+   int listening, listening_generation;
+   int window_clamp;
+   int left_tls_packet_length;
++  int wpp_secret_id; /* WPP: 1 + index of the client's key, 0 while unknown */
++  long long wpp_pending_bytes[2]; /* WPP: bytes seen before the key was known */
+ 
+   struct raw_message in_u, in, out, out_p;
+ 
+@@ -442,6 +444,11 @@
+ 
+ extern int max_special_connections, active_special_connections;
+ extern conn_type_t *wpp_client_conn_type;
++/* WPP: client socket bytes per key: [key][0] read from client, [key][1] written */
++#define WPP_MAX_SECRETS 64
++extern long long wpp_secret_bytes[WPP_MAX_SECRETS][2];
++/* WPP: call once the client's key is known; moves bytes seen before that. */
++void wpp_attribute_secret (struct connection_info *c, int secret_index);
+ 
+ #define MAX_NAT_INFO_RULES	16
+ extern int nat_info_rules;
+diff -ruN a/net/net-tcp-rpc-ext-server.c b/net/net-tcp-rpc-ext-server.c
+--- a/net/net-tcp-rpc-ext-server.c	2026-10-23 23:52:32.996500364 +0300
++++ b/net/net-tcp-rpc-ext-server.c	2026-10-23 23:52:15.000000000 +0300
+@@ -156,6 +156,14 @@
+   memcpy (ext_secret[ext_secret_cnt ++], secret, 16);
+ }
+ 
++/* WPP: number of configured keys; copies key `index` to `secret` when valid. */
++int tcp_rpcs_get_ext_secret (int index, unsigned char secret[16]) {
++  if (index >= 0 && index < ext_secret_cnt) {
++    memcpy (secret, ext_secret[index], 16);
++  }
++  return ext_secret_cnt;
++}
++
+ static int allow_only_tls;
+ 
+ struct domain_info {
+@@ -1335,6 +1343,10 @@
+ 
+           int target = *(short *)(random_header + 60);
+           D->extra_int4 = target;
++          // WPP: remember which key the client used, for per-key traffic.
++          if (ext_secret_cnt > 0) {
++            wpp_attribute_secret (c, secret_id);
++          }
+           vkprintf (1, "tcp opportunistic encryption mode detected, tag = %08x, target=%d\n", tag, target);
+           ok = 1;
+           break;

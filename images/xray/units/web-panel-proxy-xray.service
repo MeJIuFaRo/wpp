@@ -1,0 +1,9 @@
+[Unit]
+Description=WEB PANEL PROXY Xray (VLESS and Hysteria 2)
+
+# No [Install]: the panel enables Xray only while VLESS/Hysteria2 profiles exist.
+[Service]
+Type=simple
+ExecStart=/opt/web-panel-proxy/xray/xray run -config /etc/web-panel-proxy-xray/config.json
+Restart=on-failure
+RestartSec=2

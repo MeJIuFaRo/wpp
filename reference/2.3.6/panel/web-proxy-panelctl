@@ -1,0 +1,817 @@
+#!/usr/bin/env python3
+import copy, fcntl, grp, json, os, re, secrets, shutil, subprocess, sys, time, uuid
+sys.path.insert(0,"/opt/tproxy-panel")
+import wpp_mtproto as shared_mt
+from wpp_subscriptions import mutate as mutate_subscription, issue as issue_subscription, SubscriptionError
+
+USERS="/etc/web-proxy-panel/users.json"
+PROFILES="/etc/tproxy-server/profiles.json"
+UNIT_DIR="/etc/systemd/system"
+FIREWALL_SCRIPT="/usr/local/sbin/web-proxy-panel-user-firewall"
+MT_BIN="/opt/MTProxy/objs/bin/mtproto-proxy"
+MT_AES="/etc/mtproxy/proxy-secret"
+MT_CONF="/etc/mtproxy/proxy-multi.conf"
+XRAY_BIN="/opt/web-panel-proxy/xray/xray"
+XRAY_CONFIG="/etc/web-panel-proxy-xray/config.json"
+XRAY_PATH_FILE="/etc/web-proxy-panel/xray-path"
+XRAY_CERT="/etc/web-panel-proxy-xray/tls/domain.crt"
+XRAY_KEY="/etc/web-panel-proxy-xray/tls/domain.key"
+XRAY_SERVICE="web-panel-proxy-xray.service"
+XRAY_TLS_SYNC="/usr/local/sbin/web-panel-proxy-sync-tls"
+XRAY_VLESS_PORT=10000
+XRAY_API="127.0.0.1:10085"
+HYSTERIA_PORT=8443
+CADDYFILE="/etc/caddy/Caddyfile"
+TRAFFIC_FILE="/var/lib/tproxy-panel/traffic.json"
+TRAFFIC_LOCK="/var/lib/tproxy-panel/traffic.lock"
+UFW_HYSTERIA_MARKER="/etc/web-proxy-panel/hysteria-ufw-owned"
+UFW_MTPROTO_MARKER="/etc/web-proxy-panel/mtproto-ufw-owned"
+BASE_PORT=2399
+BASE_STATS=8889
+MAX_USERS=128
+
+def run(*args, check=False, timeout=60):
+    p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=timeout)
+    if check and p.returncode:
+        raise RuntimeError(p.stderr.strip() or "command failed")
+    return p
+
+def load():
+    try:
+        with open(USERS,encoding="utf-8") as f:
+            d=json.load(f)
+            d.setdefault("users",[])
+            d.setdefault("traffic",{})
+            d.setdefault("subscriptions",[])
+            # Remove the two withdrawn experimental protocols. Subscription
+            # records keep working with their stable VLESS/Hysteria2 profiles.
+            d["users"]=[u for u in d["users"] if u.get("protocol","web") not in ("mieru","naive")]
+            for sub in d["subscriptions"]:
+                supported=[p for p in sub.get("protocols",[]) if p in ("vless","hysteria")]
+                sub["protocols"]=supported or ["vless","hysteria"]
+            d["users"]=[u for u in d["users"] if not (u.get("subscription_id") and u.get("protocol")=="web")]
+            for u in d["users"]:
+                protocol=u.setdefault("protocol","web")
+                # V2.2 briefly exposed experimental per-profile transports and
+                # ports.  Stable V2.1 deliberately has one tested VLESS XHTTP
+                # listener behind Caddy/443 and one Hysteria2 UDP/8443 listener.
+                # Normalize those records while preserving IDs and secrets.
+                if protocol=="vless":
+                    u["backend_port"]=443
+                    for key in ("transport","path","xray_port","xhttp_mode","fingerprint","legacy_shared"):
+                        u.pop(key,None)
+                elif protocol=="hysteria":
+                    u["backend_port"]=HYSTERIA_PORT
+                    for key in ("udp_idle_timeout","masquerade"):
+                        u.pop(key,None)
+            return d
+    except FileNotFoundError:
+        return {"users":[],"traffic":{},"subscriptions":[]}
+
+def save(d):
+    tmp=USERS+".tmp"
+    with open(tmp,"w",encoding="utf-8") as f:
+        json.dump(d,f,ensure_ascii=True,indent=2)
+    os.chmod(tmp,0o600)
+    os.replace(tmp,USERS)
+
+def port_in_use(port):
+    # Do not rely solely on users.json: a stopped/old installation can still
+    # have an MTProxy process listening on a port that is absent from the file.
+    sockets=run("ss","-lnt").stdout or ""
+    return re.search(r"[:.]%d\b" % int(port),sockets) is not None
+
+def alloc_ports(d, protocol="web"):
+    if protocol == "mtproto":
+        shared_mt.validate(d)
+        return shared_mt.PORT, shared_mt.STATS
+    used={int(u.get("backend_port",0)) for u in d["users"]}
+    used_stats={int(u.get("stats_port",0)) for u in d["users"]} | {shared_mt.STATS}
+    p,s=BASE_PORT,BASE_STATS
+    while p in used or s in used_stats or port_in_use(p) or port_in_use(s):
+        p+=1; s+=1
+    if p>=BASE_PORT+MAX_USERS:
+        raise RuntimeError("Maximum panel users reached")
+    return p,s
+
+def write_unit(u):
+    if u.get("protocol","web") != "web":
+        return
+    path=os.path.join(UNIT_DIR,f"web-proxy-user-{u['id']}.service")
+    content=f"""[Unit]
+Description=WEB Proxy User {u['id']}
+After=network-online.target web-proxy-panel-firewall.service
+Wants=network-online.target
+Requires=web-proxy-panel-firewall.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart={MT_BIN} -u nobody -p {int(u['stats_port'])} -H {int(u['backend_port'])} -S {u['secret']} --aes-pwd {MT_AES} {MT_CONF} -M 1
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+"""
+    tmp=path+".tmp"
+    with open(tmp,"w",encoding="utf-8") as f: f.write(content)
+    os.chmod(tmp,0o644)
+    os.replace(tmp,path)
+
+def sync_firewall(d):
+    # Preserve the last counters before recreating the nftables table.
+    try: collect_traffic(d)
+    except Exception: pass
+    web_ports=[int(u["backend_port"]) for u in d["users"] if u.get("enabled",True) and u.get("protocol","web")=="web"]
+    mtproto_ports=[int(u["backend_port"]) for u in d["users"] if u.get("enabled",True) and u.get("protocol","web")=="mtproto"]
+    stats=[int(u["stats_port"]) for u in d["users"] if u.get("enabled",True) and u.get("protocol","web") in ("web","mtproto") and u.get("stats_port")]
+    hysteria_enabled=any(u.get("enabled",True) and u.get("protocol")=="hysteria" for u in d["users"])
+    lines=[
+        "#!/usr/bin/env bash",
+        "set -e",
+        "nft list table inet web_proxy_panel >/dev/null 2>&1 && nft delete table inet web_proxy_panel || true",
+        "nft add table inet web_proxy_panel",
+        "nft 'add chain inet web_proxy_panel input { type filter hook input priority -20; policy accept; }'",
+        "nft 'add chain inet web_proxy_panel output { type filter hook output priority -20; policy accept; }'",
+        "nft 'add rule inet web_proxy_panel output oifname \"lo\" tcp dport 2398 counter comment \"wpp:primary:up\"'",
+        "nft 'add rule inet web_proxy_panel input iifname \"lo\" tcp sport 2398 counter comment \"wpp:primary:down\"'"
+    ]
+    for u in d["users"]:
+        if u.get("enabled",True) and u.get("protocol","web")=="web":
+            uid=u["id"]
+            port=int(u["backend_port"])
+            lines.append("nft 'add rule inet web_proxy_panel output oifname \"lo\" tcp dport %d counter comment \"wpp:%s:up\"'"%(port,uid))
+            lines.append("nft 'add rule inet web_proxy_panel input iifname \"lo\" tcp sport %d counter comment \"wpp:%s:down\"'"%(port,uid))
+    if shared_mt.UNIT.exists() or shared_mt.profiles(d):
+        lines.append("nft 'add rule inet web_proxy_panel input iifname != \"lo\" tcp dport 8443 counter accept comment \"wpp:mtproto_shared:up\"'")
+        lines.append("nft 'add rule inet web_proxy_panel output oifname != \"lo\" tcp sport 8443 counter accept comment \"wpp:mtproto_shared:down\"'")
+        stats.append(shared_mt.STATS)
+    if web_ports:
+        lines.append("nft 'add rule inet web_proxy_panel input iifname != \"lo\" tcp dport { %s } counter drop'" % ",".join(map(str,sorted(web_ports))))
+    if stats:
+        lines.append("nft 'add rule inet web_proxy_panel input iifname != \"lo\" tcp dport { %s } counter drop'" % ",".join(map(str,sorted(set(stats)))))
+    if hysteria_enabled:
+        lines.append("nft 'add rule inet web_proxy_panel input udp dport %d counter accept'" % HYSTERIA_PORT)
+    tmp=FIREWALL_SCRIPT+".tmp"
+    with open(tmp,"w",encoding="utf-8") as f: f.write("\n".join(lines)+"\n")
+    os.chmod(tmp,0o750)
+    os.replace(tmp,FIREWALL_SCRIPT)
+    run(FIREWALL_SCRIPT,check=True)
+    if shutil.which("ufw"):
+        status=run("ufw","status").stdout or ""
+        if "Status: active" in status:
+            # Track only rules actually created by WPP, so deleting a client
+            # never removes a pre-existing administrator firewall rule.
+            previous_mt=set()
+            if os.path.exists(UFW_MTPROTO_MARKER):
+                try:
+                    previous_mt={int(x) for x in re.findall(r"\b\d{1,5}\b",open(UFW_MTPROTO_MARKER,encoding="ascii").read()) if 1 <= int(x) <= 65535}
+                except Exception:
+                    previous_mt=set()
+            desired_mt=set(mtproto_ports)
+            for port in sorted(previous_mt-desired_mt):
+                run("ufw","delete","allow",str(port)+"/tcp")
+            owned_mt=previous_mt & desired_mt
+            status=run("ufw","status").stdout or ""
+            for port in sorted(desired_mt):
+                present=re.search(r"(?m)^%d/tcp\s+ALLOW\b" % port,status) is not None
+                if not present:
+                    added=run("ufw","allow",str(port)+"/tcp","comment","WEB PANEL PROXY MTProto")
+                    if added.returncode:
+                        raise RuntimeError("Could not open MTProto in UFW: "+(added.stderr or added.stdout)[-1000:])
+                    owned_mt.add(port)
+            if owned_mt:
+                with open(UFW_MTPROTO_MARKER,"w",encoding="ascii") as f: f.write("".join(str(p)+"\n" for p in sorted(owned_mt)))
+                os.chmod(UFW_MTPROTO_MARKER,0o600)
+            elif os.path.exists(UFW_MTPROTO_MARKER):
+                os.unlink(UFW_MTPROTO_MARKER)
+            previous=[]
+            if os.path.exists(UFW_HYSTERIA_MARKER):
+                try:
+                    marker=open(UFW_HYSTERIA_MARKER,encoding="ascii").read()
+                    previous=[int(x) for x in re.findall(r"\b\d{1,5}\b",marker) if 1 <= int(x) <= 65535]
+                    if not previous and marker.strip()=="owned": previous=[HYSTERIA_PORT]
+                except Exception:
+                    previous=[]
+            # Close only ports recorded as owned by WEB PANEL PROXY.  This also
+            # removes experimental V2.2 Hysteria ports during a stable rollback.
+            for port in sorted(set(previous)-({HYSTERIA_PORT} if hysteria_enabled else set())):
+                run("ufw","delete","allow",str(port)+"/udp")
+            status=run("ufw","status").stdout or ""
+            present=re.search(r"(?m)^%d/udp\s+ALLOW\b" % HYSTERIA_PORT,status) is not None
+            if hysteria_enabled and not present:
+                added=run("ufw","allow",str(HYSTERIA_PORT)+"/udp","comment","WEB PANEL PROXY Hysteria 2")
+                if added.returncode:
+                    raise RuntimeError("Could not open Hysteria 2 in UFW: "+(added.stderr or added.stdout)[-1000:])
+            if hysteria_enabled:
+                with open(UFW_HYSTERIA_MARKER,"w",encoding="ascii") as f: f.write(str(HYSTERIA_PORT)+"\n")
+                os.chmod(UFW_HYSTERIA_MARKER,0o600)
+            elif os.path.exists(UFW_HYSTERIA_MARKER):
+                os.unlink(UFW_HYSTERIA_MARKER)
+
+def sync_profiles(d):
+    with open(PROFILES,encoding="utf-8") as f:
+        old=json.load(f)
+    keep=[p for p in old.get("profiles",[]) if not str(p.get("name","")).startswith("panel:")]
+    for u in d["users"]:
+        if u.get("enabled",True) and u.get("protocol","web")=="web":
+            keep.append({
+                "name":"panel:"+u["id"],
+                "secret":u["secret"],
+                "backend":"127.0.0.1:%d"%int(u["backend_port"]),
+                "carrier_mode":"https"
+            })
+    tmp=PROFILES+".tmp"
+    with open(tmp,"w",encoding="utf-8") as f:
+        json.dump({"profiles":keep},f,ensure_ascii=True,indent=2)
+    os.chmod(tmp,0o400); shutil.chown(tmp,user="tproxy",group="tproxy")
+    c=run("/usr/local/bin/tproxy-server","-config","/etc/tproxy-server/config.json","-profiles-file",tmp,"-check")
+    if c.returncode:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+        raise RuntimeError("tproxy-server config check failed: "+(c.stderr or c.stdout)[-2000:])
+    os.replace(tmp,PROFILES)
+
+def sync_xray(d):
+    with open(XRAY_PATH_FILE,encoding="utf-8") as f:
+        xray_path=f.read().strip()
+    if not re.fullmatch(r"/vless-[a-f0-9]{24}",xray_path):
+        raise RuntimeError("Invalid stored VLESS path")
+    vless=[]
+    hysteria=[]
+    for u in d["users"]:
+        if not u.get("enabled",True):
+            continue
+        protocol=u.get("protocol","web")
+        if protocol=="vless":
+            vless.append({"id":u["secret"],"email":"panel:"+u["id"],"level":0})
+        elif protocol=="hysteria":
+            hysteria.append({"auth":u["secret"],"email":"panel:"+u["id"],"level":0})
+    inbounds=[]
+    if vless:
+        inbounds.append({
+            "tag":"vless-xhttp",
+            "listen":"127.0.0.1",
+            "port":XRAY_VLESS_PORT,
+            "protocol":"vless",
+            "settings":{"clients":vless,"decryption":"none"},
+            "streamSettings":{
+                # Xray's JSON stream selector is named "network".
+                "network":"xhttp",
+                "security":"none",
+                "xhttpSettings":{"path":xray_path,"mode":"auto"}
+            },
+            "sniffing":{"enabled":True,"destOverride":["http","tls","quic"],"routeOnly":True}
+        })
+    if hysteria:
+        if not (os.path.isfile(XRAY_CERT) and os.path.isfile(XRAY_KEY)):
+            raise RuntimeError("TLS certificate for Hysteria 2 is not ready")
+        inbounds.append({
+            "tag":"hysteria2",
+            "listen":"0.0.0.0",
+            "port":HYSTERIA_PORT,
+            "protocol":"hysteria",
+            "settings":{"version":2,"clients":hysteria},
+            "streamSettings":{
+                "network":"hysteria",
+                "security":"tls",
+                "tlsSettings":{
+                    "alpn":["h3"],
+                    "minVersion":"1.3",
+                    "certificates":[{"certificateFile":XRAY_CERT,"keyFile":XRAY_KEY}]
+                },
+                "hysteriaSettings":{"version":2,"udpIdleTimeout":60}
+            },
+            "sniffing":{"enabled":True,"destOverride":["http","tls","quic"],"routeOnly":True}
+        })
+    config={
+        "log":{"loglevel":"warning"},
+        "api":{"tag":"api","listen":XRAY_API,"services":["StatsService"]},
+        "stats":{},
+        "policy":{
+            "levels":{"0":{"statsUserUplink":True,"statsUserDownlink":True}},
+            "system":{"statsInboundUplink":True,"statsInboundDownlink":True}
+        },
+        "inbounds":inbounds,
+        "outbounds":[{"tag":"direct","protocol":"freedom"}]
+    }
+    # Xray selects the configuration parser from the final extension.  A name
+    # such as config.json.tmp is rejected before JSON parsing, so keep .json
+    # as the temporary file's last suffix.
+    tmp=os.path.splitext(XRAY_CONFIG)[0]+".tmp.json"
+    with open(tmp,"w",encoding="utf-8") as f:
+        json.dump(config,f,ensure_ascii=True,indent=2)
+    os.chown(tmp,0,grp.getgrnam("xray").gr_gid)
+    os.chmod(tmp,0o640)
+    check=run(XRAY_BIN,"run","-test","-config",tmp,timeout=60)
+    if check.returncode:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+        raise RuntimeError("Xray config check failed: "+(check.stderr or check.stdout)[-3000:])
+    os.replace(tmp,XRAY_CONFIG)
+    if inbounds:
+        run("systemctl","enable",XRAY_SERVICE,check=True)
+        run("systemctl","restart",XRAY_SERVICE,check=True)
+        if run("systemctl","is-active","--quiet",XRAY_SERVICE).returncode:
+            st=run("systemctl","status",XRAY_SERVICE,"--no-pager","--full")
+            log=run("journalctl","-u",XRAY_SERVICE,"-n","50","--no-pager")
+            raise RuntimeError("Xray failed: "+((st.stdout or st.stderr)+"\n"+(log.stdout or log.stderr))[-4000:])
+    else:
+        run("systemctl","disable","--now",XRAY_SERVICE,check=False)
+
+def _load_traffic():
+    try:
+        with open(TRAFFIC_FILE,encoding="utf-8") as f:
+            value=json.load(f)
+            return value if isinstance(value,dict) else {}
+    except Exception:
+        return {}
+
+def _save_traffic(value):
+    os.makedirs(os.path.dirname(TRAFFIC_FILE),mode=0o700,exist_ok=True)
+    tmp=TRAFFIC_FILE+".tmp"
+    with open(tmp,"w",encoding="utf-8") as f:
+        json.dump(value,f,ensure_ascii=True,indent=2)
+    os.chmod(tmp,0o600)
+    os.replace(tmp,TRAFFIC_FILE)
+
+def _nft_traffic():
+    result={}
+    p=run("nft","-j","list","table","inet","web_proxy_panel",timeout=10)
+    if p.returncode: return result
+    try: doc=json.loads(p.stdout)
+    except Exception: return result
+    for item in doc.get("nftables",[]):
+        rule=item.get("rule",{})
+        comment=str(rule.get("comment", ""))
+        m=re.fullmatch(r"wpp:([A-Za-z0-9_-]+):(up|down)",comment)
+        if not m: continue
+        count=0
+        for expr in rule.get("expr",[]):
+            if "counter" in expr:
+                count=int(expr["counter"].get("bytes",0)); break
+        result.setdefault(m.group(1),{"up":0,"down":0})[m.group(2)]=count
+    return result
+
+def _xray_traffic():
+    result={}
+    if run("systemctl","is-active","--quiet",XRAY_SERVICE).returncode:
+        return result
+    p=run(XRAY_BIN,"api","statsquery","--server="+XRAY_API,timeout=15)
+    if p.returncode: return result
+    try:
+        start=p.stdout.find("{")
+        doc=json.loads(p.stdout[start:])
+    except Exception:
+        return result
+    for stat in doc.get("stat",[]):
+        m=re.fullmatch(r"user>>>panel:([a-f0-9]+)>>>traffic>>>(uplink|downlink)",str(stat.get("name","")))
+        if not m: continue
+        key="up" if m.group(2)=="uplink" else "down"
+        result.setdefault(m.group(1),{"up":0,"down":0})[key]=int(stat.get("value",0))
+    return result
+
+def _collect_traffic_unlocked(d=None):
+    d=d or load()
+    now=int(time.time())
+    current=_nft_traffic()
+    current.update(_xray_traffic())
+    state=_load_traffic()
+    targets={"primary":{"protocol":"web","enabled":True}}
+    targets.update({u["id"]:u for u in d.get("users",[]) if u.get("protocol") != "mtproto"})
+    targets["mtproto_shared"]={"protocol":"mtproto","enabled":bool(shared_mt.validate(d))}
+    for uid in list(state):
+        if uid != 'mtproto_shared' and state[uid].get('protocol') == 'mtproto':
+            state.pop(uid)  # Historical per-key counters are in the migration backup.
+
+    service_states={}
+    for uid,u in targets.items():
+        raw=current.get(uid)
+        entry=state.setdefault(uid,{"up":0,"down":0,"raw_up":0,"raw_down":0,"last_change":0})
+        changed=False
+        for direction in ("up","down"):
+            # A missing API/counter sample is not a reset to zero. Keeping the
+            # baseline prevents counting all historical bytes again next time.
+            if raw is None: continue
+            value=max(0,int(raw.get(direction,0)))
+            previous=max(0,int(entry.get("raw_"+direction,0)))
+            delta=value-previous if value>=previous else value
+            if delta>0:
+                entry[direction]=max(0,int(entry.get(direction,0)))+delta
+                changed=True
+            entry["raw_"+direction]=value
+        if changed: entry["last_change"]=now
+        protocol=u.get("protocol","web")
+        if uid=="primary":
+            unit="mtproxy.service"
+        elif protocol=="web":
+            unit="web-proxy-user-"+uid+".service"
+        elif protocol in ("vless","hysteria"):
+            unit=XRAY_SERVICE
+        elif protocol=="mtproto":
+            unit=shared_mt.SERVICE
+        else:
+            unit=""
+        if unit not in service_states:
+            service_states[unit]=(run("systemctl","is-active","--quiet",unit).returncode==0)
+        entry["service_active"]=service_states[unit] and u.get("enabled",True)
+        if raw is not None: entry["updated_at"]=now
+        entry["protocol"]=protocol
+    state['mtproto_shared']['connections']=shared_mt.connection_count()
+    state['mtproto_shared']['scope']='shared'
+    _save_traffic(state)
+    return state
+
+def collect_traffic(d=None):
+    os.makedirs(os.path.dirname(TRAFFIC_LOCK),mode=0o700,exist_ok=True)
+    with open(TRAFFIC_LOCK,"a+",encoding="ascii") as lock:
+        os.chmod(TRAFFIC_LOCK,0o600)
+        fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+        return _collect_traffic_unlocked(d)
+
+def remove_old_units(d):
+    keep={"web-proxy-user-"+u["id"]+".service" for u in d["users"] if u.get("enabled",True) and u.get("protocol","web")=="web"}
+    for name in os.listdir(UNIT_DIR):
+        if name.startswith("web-proxy-user-") and name.endswith(".service") and name not in keep:
+            run("systemctl","disable","--now",name,check=False)
+            try: os.remove(os.path.join(UNIT_DIR,name))
+            except FileNotFoundError: pass
+
+def apply(d,restart=True):
+    with open(PROFILES,encoding="utf-8") as f:
+        old_profiles=f.read()
+    if os.path.exists(XRAY_CONFIG):
+        with open(XRAY_CONFIG,encoding="utf-8") as f:
+            old_xray=f.read()
+    else:
+        old_xray=None
+    with open(CADDYFILE,encoding="utf-8") as f:
+        old_caddy=f.read()
+    old_users=load()
+    try:
+        for u in d["users"]:
+            if u.get("enabled",True): write_unit(u)
+        remove_old_units(d)
+        sync_profiles(d)
+        sync_firewall(d)
+        run("systemctl","daemon-reload",check=True)
+        sync_xray(d)
+        shared_mt.sync(d)
+        if restart:
+            for u in d["users"]:
+                if u.get("enabled",True) and u.get("protocol","web")=="web":
+                    unit="web-proxy-user-"+u["id"]+".service"
+                    run("systemctl","enable",unit,check=True)
+                    run("systemctl","restart",unit,check=True)
+                    if run("systemctl","is-active","--quiet",unit).returncode:
+                        st=run("systemctl","status",unit,"--no-pager","--full")
+                        log=run("journalctl","-u",unit,"-n","30","--no-pager")
+                        detail=((st.stdout or st.stderr)+"\n"+(log.stdout or log.stderr))[-3500:]
+                        raise RuntimeError("User MTProxy failed: "+detail)
+                    # Verify the actual WEB backend listener on its loopback port.
+                    listening=False
+                    for attempt in range(50):
+                        if port_in_use(int(u["backend_port"])):
+                            listening=True
+                            break
+                        time.sleep(0.1)
+                    if not listening:
+                        st=run("systemctl","status",unit,"--no-pager","--full")
+                        raise RuntimeError("User MTProxy is active but backend port is not listening: "+(st.stdout or st.stderr)[-2000:])
+            run("systemctl","restart","tproxy-server.service",check=True)
+    except Exception:
+        with open(PROFILES,"w",encoding="utf-8") as f: f.write(old_profiles)
+        os.chmod(PROFILES,0o400)
+        save(old_users)
+        if old_xray is None:
+            try: os.unlink(XRAY_CONFIG)
+            except FileNotFoundError: pass
+        else:
+            with open(XRAY_CONFIG,"w",encoding="utf-8") as f: f.write(old_xray)
+            os.chmod(XRAY_CONFIG,0o640)
+        if old_xray is None:
+            run("systemctl","disable","--now",XRAY_SERVICE,check=False)
+        else:
+            run("systemctl","restart",XRAY_SERVICE,check=False)
+        with open(CADDYFILE,"w",encoding="utf-8") as f: f.write(old_caddy)
+        try: shutil.chown(CADDYFILE,user="root",group="caddy")
+        except Exception: pass
+        os.chmod(CADDYFILE,0o640)
+        run("systemctl","reload","caddy.service",check=False)
+        raise
+
+def reload_web_profiles():
+    import urllib.request
+    # Local administrative endpoint, never use environment proxy settings.
+    opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for attempt in range(3):
+        try:
+            req=urllib.request.Request('http://127.0.0.1:8081/profiles/reload',
+                data=b'',method='POST',headers={'X-WPP-Reload':'1'})
+            with opener.open(req,timeout=10) as response:
+                if response.status != 204: raise RuntimeError('WEB profile reload failed')
+            return
+        except Exception:
+            if attempt == 2: raise RuntimeError('WEB profile reload failed') from None
+            time.sleep(0.2)
+
+def add_web_hot(name):
+    before=load()
+    if sum(not u.get('subscription_id') for u in before['users']) >= MAX_USERS:
+        raise RuntimeError('Maximum panel users reached')
+    d=copy.deepcopy(before)
+    port,stats=alloc_ports(d,'web')
+    u={'id':secrets.token_hex(8),'name':name.strip(),'protocol':'web',
+       'enabled':True,'created_at':int(time.time()),'secret':secrets.token_hex(16),
+       'backend_port':port,'stats_port':stats}
+    d['users'].append(u)
+    unit='web-proxy-user-'+u['id']+'.service'
+    with open(PROFILES,'rb') as f: old_profiles=f.read()
+    try:
+        # Install firewall protection before the new backend starts listening.
+        sync_firewall(d)
+        write_unit(u)
+        run('systemctl','daemon-reload',check=True)
+        run('systemctl','enable','--now',unit,check=True)
+        for _ in range(50):
+            if port_in_use(port): break
+            time.sleep(0.1)
+        else: raise RuntimeError('New WEB backend did not become ready')
+        if run('systemctl','is-active','--quiet',unit).returncode:
+            raise RuntimeError('New WEB backend is not active')
+        sync_profiles(d)
+        save(d)
+        reload_web_profiles()
+    except Exception:
+        tmp=PROFILES+'.tmp'
+        with open(tmp,'wb') as f: f.write(old_profiles)
+        os.chmod(tmp,0o400); shutil.chown(tmp,user="tproxy",group="tproxy");os.replace(tmp,PROFILES)
+        save(before)
+        # Reconcile an ambiguous HTTP response without restarting the relay.
+        try: reload_web_profiles()
+        finally:
+            run('systemctl','disable','--now',unit)
+            path=os.path.join(UNIT_DIR,unit)
+            if os.path.exists(path): os.unlink(path)
+            run('systemctl','daemon-reload')
+            sync_firewall(before)
+        raise
+    print(json.dumps(u,ensure_ascii=True))
+
+def add(protocol,name):
+    if protocol == 'web':
+        return add_web_hot(name)
+    d=load()
+    before=copy.deepcopy(d)
+    if protocol == 'mtproto':
+        if sum(not u.get('subscription_id') for u in d['users']) >= MAX_USERS:
+            raise RuntimeError('Maximum panel users reached')
+        u={'id':secrets.token_hex(8),'name':name.strip(),'protocol':'mtproto',
+           'enabled':True,'created_at':int(time.time()),'secret':secrets.token_hex(16),
+           'backend_port':shared_mt.PORT,'stats_port':shared_mt.STATS}
+        d['users'].append(u)
+        shared_mt.change(before,d,save)
+        print(json.dumps(u,ensure_ascii=True))
+        return
+    # A failed request from an older manager can leave a systemd unit in an
+    # auto-restart loop even though it is absent from users.json. Remove such
+    # orphan units before choosing ports for the next user.
+    remove_old_units(d)
+    run("systemctl","daemon-reload",check=True)
+    if protocol not in ("web","mtproto","vless","hysteria"):
+        raise RuntimeError("Unknown proxy protocol")
+    if sum(not u.get("subscription_id") for u in d["users"])>=MAX_USERS:
+        raise RuntimeError("Maximum panel users reached")
+    u={"id":secrets.token_hex(8),"name":name.strip(),"protocol":protocol,"enabled":True,"created_at":int(time.time())}
+    if protocol in ("web","mtproto"):
+        port,stats=alloc_ports(d,protocol)
+        u.update({"secret":secrets.token_hex(16),"backend_port":port,"stats_port":stats})
+    elif protocol=="vless":
+        u.update({"secret":str(uuid.uuid4()),"backend_port":443})
+    elif protocol=="hysteria":
+        u.update({"secret":str(uuid.uuid4()),"backend_port":HYSTERIA_PORT})
+        tls=run(XRAY_TLS_SYNC)
+        if tls.returncode:
+            raise RuntimeError("Hysteria 2 TLS certificate is not ready: "+(tls.stderr or tls.stdout)[-1500:])
+    d["users"].append(u)
+    save(d)
+    try:
+        apply(d,True)
+    except Exception:
+        # Re-apply the saved state so that a failed new unit is stopped and
+        # deleted. Without this rollback a restart loop holds the same port
+        # and every following attempt to create a user fails as well.
+        save(before)
+        try: apply(before,True)
+        except Exception: pass
+        raise
+    print(json.dumps(u,ensure_ascii=True))
+
+def federation_sync(request):
+    external_id=str(request.get("external_id", ""))
+    name=str(request.get("name", "")).strip()
+    protocols=request.get("protocols", [])
+    if not re.fullmatch(r"[a-f0-9]{32,64}",external_id):
+        raise ValueError("Invalid federation id")
+    if not name or len(name)>80 or any(ord(c)<32 for c in name):
+        raise ValueError("Invalid federation profile name")
+    if not isinstance(protocols,list) or not protocols or any(p not in ("vless","hysteria") for p in protocols):
+        raise ValueError("Federation supports VLESS and Hysteria2")
+    protocols=list(dict.fromkeys(protocols))
+    before=load(); d=copy.deepcopy(before)
+    d["users"]=[u for u in d["users"] if u.get("federation_id")!=external_id or u.get("protocol") in protocols]
+    for user in d["users"]:
+        if user.get("federation_id")==external_id:
+            user["name"]=name+" · "+("VLESS" if user["protocol"]=="vless" else "Hysteria2")
+            user["enabled"]=True
+    for protocol in protocols:
+        if any(u.get("federation_id")==external_id and u.get("protocol")==protocol for u in d["users"]):
+            continue
+        if protocol=="hysteria":
+            tls=run(XRAY_TLS_SYNC)
+            if tls.returncode: raise RuntimeError("Hysteria2 TLS certificate is not ready")
+        d["users"].append({"id":secrets.token_hex(8),"name":name+" · "+("VLESS" if protocol=="vless" else "Hysteria2"),
+            "protocol":protocol,"enabled":True,"secret":str(uuid.uuid4()),
+            "backend_port":443 if protocol=="vless" else HYSTERIA_PORT,
+            "federation_id":external_id,"created_at":int(time.time())})
+    save(d)
+    try: apply(d,True)
+    except Exception:
+        save(before)
+        try: apply(before,True)
+        except Exception: pass
+        raise
+    print(json.dumps({"ok":True,"profiles":[u for u in d["users"] if u.get("federation_id")==external_id]},ensure_ascii=True))
+
+def federation_delete(external_id):
+    if not re.fullmatch(r"[a-f0-9]{32,64}",external_id): raise ValueError("Invalid federation id")
+    before=load(); d=copy.deepcopy(before)
+    d["users"]=[u for u in d["users"] if u.get("federation_id")!=external_id]
+    if d==before:
+        print(json.dumps({"ok":True,"deleted":False})); return
+    save(d)
+    try: apply(d,True)
+    except Exception:
+        save(before)
+        try: apply(before,True)
+        except Exception: pass
+        raise
+    print(json.dumps({"ok":True,"deleted":True}))
+
+def federation_purge():
+    before=load(); d=copy.deepcopy(before)
+    removed=sum(1 for u in d["users"] if u.get("federation_id"))
+    d["users"]=[u for u in d["users"] if not u.get("federation_id")]
+    if not removed:
+        print(json.dumps({"ok":True,"deleted":0})); return
+    save(d)
+    try: apply(d,True)
+    except Exception:
+        save(before)
+        try: apply(before,True)
+        except Exception: pass
+        raise
+    print(json.dumps({"ok":True,"deleted":removed}))
+
+def delete(uid):
+    before=load()
+    if any(u['id']==uid for u in shared_mt.profiles(before)):
+        after=copy.deepcopy(before)
+        after['users']=[u for u in after['users'] if u['id']!=uid]
+        shared_mt.change(before,after,save)
+        return True
+    if any(u.get("id")==uid and u.get("subscription_id") for u in before["users"]):
+        raise RuntimeError("Управляйте этим профилем через вкладку Подписки.")
+    try: collect_traffic(before)
+    except Exception: pass
+    d=copy.deepcopy(before)
+    if not any(u.get("id")==uid for u in d["users"]):
+        # Deletion may be repeated after a browser refresh or after a prior
+        # successful request.  Treat that situation as an already-completed
+        # deletion instead of returning a traceback to the panel.
+        return False
+    d["users"]=[u for u in d["users"] if u.get("id")!=uid]
+    save(d)
+    try:
+        apply(d,True)
+    except Exception:
+        save(before)
+        try: apply(before,True)
+        except Exception: pass
+        raise
+    return True
+
+def edit_user(uid,enabled=None,name=None):
+    before=load()
+    target=next((u for u in before['users'] if u['id']==uid),None)
+    if uid=='primary' or target is None or target.get('subscription_id'):
+        raise ValueError('Отдельный пользователь не найден или недоступен для изменения.')
+    if enabled is not None and not isinstance(enabled,bool): raise ValueError('Некорректное состояние доступа.')
+    if name is not None and (not name.strip() or len(name.strip())>80 or any(ord(c)<32 for c in name)):
+        raise ValueError('Имя должно содержать от 1 до 80 символов.')
+    after=copy.deepcopy(before)
+    user=next(u for u in after['users'] if u['id']==uid)
+    if enabled is not None: user['enabled']=enabled
+    if name is not None: user['name']=name.strip()
+    if after==before: return
+    if target.get('protocol') == 'mtproto':
+        shared_mt.change(before,after,save)
+        return
+    runtime_changed=user.get('enabled',True)!=target.get('enabled',True)
+    if runtime_changed: collect_traffic(before)
+    save(after)
+    if runtime_changed:
+        try: apply(after,True)
+        except Exception:
+            save(before)
+            try: apply(before,True)
+            except Exception: raise RuntimeError('Не удалось восстановить службы. Проверьте VPS через SSH.')
+            raise
+
+def init():
+    d=load()
+    # Persist stable normalization when upgrading or rolling back from an
+    # experimental build; existing user IDs and secrets remain unchanged.
+    save(d)
+    for u in d["users"]:
+        if u.get("enabled",True): write_unit(u)
+    remove_old_units(d)
+    sync_profiles(d)
+    sync_firewall(d)
+    run("systemctl","daemon-reload",check=True)
+    sync_xray(d)
+    shared_mt.sync(d)
+    collect_traffic(d)
+
+def subscription_command():
+    try:
+        raw=sys.stdin.read(8193)
+        if len(raw)>8192: raise SubscriptionError("Request too large")
+        request=json.loads(raw)
+        if not isinstance(request,dict): raise SubscriptionError("Invalid request")
+        before=load()
+        after,result=(issue_subscription if request.get("operation")=="fetch" else mutate_subscription)(before,request)
+        changed=before["users"]!=after["users"]
+        if changed:
+            if any(u.get("enabled",True) and u.get("protocol")=="hysteria" for u in after["users"]):
+                run(XRAY_TLS_SYNC,check=True)
+            collect_traffic(before)
+            try:
+                sync_firewall(after)
+                sync_xray(after)
+                save(after)
+            except Exception:
+                # Database remains unchanged until both runtime components pass.
+                # Restore only managed Xray/firewall; never restart WEB backends.
+                try:
+                    sync_firewall(before)
+                    sync_xray(before)
+                except Exception:
+                    raise RuntimeError("Не удалось восстановить службы после ошибки; требуется диагностика VPS.")
+                raise
+        elif after!=before:
+            save(after)
+        print(json.dumps(result,ensure_ascii=True))
+    except SubscriptionError as exc:
+        print(json.dumps({"ok":False,"status":exc.status,"code":exc.code,"message":str(exc)},ensure_ascii=True))
+    except Exception:
+        print(json.dumps({"ok":False,"status":503,"code":"backend","message":"Не удалось применить подписку. Проверьте Xray и TLS на сервере."}))
+
+cmd=sys.argv[1] if len(sys.argv)>1 else "init"
+# Serialize state changes, including slot allocation, with CLI and the panel.
+# Traffic has its own lock and only reads users.json via atomic replacement.
+if cmd not in ("users","traffic"):
+    manager_lock=open("/etc/web-proxy-panel/manager.lock","a+")
+    os.chmod(manager_lock.name,0o600)
+    deadline=time.monotonic()+15
+    while True:
+        try:
+            fcntl.flock(manager_lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic()>deadline: raise SystemExit("Менеджер занят. Повторите запрос позже.")
+            time.sleep(0.1)
+if cmd=="init": init()
+elif cmd=="subscription": subscription_command()
+elif cmd=="add": add(sys.argv[2]," ".join(sys.argv[3:]))
+elif cmd=="federation-sync": federation_sync(json.load(sys.stdin))
+elif cmd=="federation-delete": federation_delete(json.load(sys.stdin).get("external_id",""))
+elif cmd=="federation-purge": federation_purge()
+elif cmd=="delete": print(json.dumps({"deleted":delete(sys.argv[2])}))
+elif cmd=="set-user":
+    if sys.argv[3] not in ('0','1'): raise SystemExit('Invalid enabled state')
+    edit_user(sys.argv[2],enabled=sys.argv[3]=='1')
+    print(json.dumps({'ok':True}))
+elif cmd=="rename-user":
+    edit_user(sys.argv[2],name=sys.argv[3])
+    print(json.dumps({'ok':True}))
+elif cmd=="sync": apply(load(),True)
+elif cmd=="firewall": sync_firewall(load())
+elif cmd=="traffic":
+    traffic_state=collect_traffic()
+    print(json.dumps(traffic_state,ensure_ascii=True))
+elif cmd=="users": print(json.dumps(load(),ensure_ascii=True))
+else: raise SystemExit("usage: init|add|delete|sync|firewall|traffic|users")
+

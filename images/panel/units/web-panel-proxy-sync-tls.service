@@ -1,0 +1,7 @@
+[Unit]
+Description=Synchronize Caddy certificate for WEB PANEL PROXY Xray
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/web-proxy-panel/panel.env
+ExecStart=/usr/local/sbin/web-panel-proxy-sync-tls --maintain

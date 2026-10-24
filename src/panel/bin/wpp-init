@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""First start of WEB PANEL PROXY in Docker (replaces install-final.sh 2.3.6).
+
+Runs in the panel container before its agent. On an empty deployment it
+creates every configuration file the services need; on later starts it only
+checks the mounts. The agent token is written last: other containers wait for
+it, so they start their services only after the configuration exists.
+
+Settings come from the environment (deploy/.env):
+  WPP_DOMAIN           panel and WEB Proxy domain (required)
+  WPP_ACME_EMAIL       e-mail for Let's Encrypt (optional)
+  WPP_PUBLIC_HOST      address in MTProto links (default: WPP_DOMAIN)
+  WPP_ADMIN_USER       panel administrator (default: admin)
+  WPP_ADMIN_PASSWORD   at least 12 characters; generated when empty
+  WPP_PANEL_PATH       /panel-<name>; generated when empty
+"""
+import base64
+import grp
+import hashlib
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, '/opt/tproxy-panel')
+
+VERSION = os.environ.get('WPP_VERSION', 'unknown')
+SHARE = Path('/usr/local/share/wpp')
+PANEL_ETC = Path('/etc/web-proxy-panel')
+DATA_DIR = Path('/var/lib/tproxy-panel')
+DATA_FILE = DATA_DIR / 'data.json'
+RELAY = Path('/etc/tproxy-server')
+MTPROXY = Path('/etc/mtproxy')
+XRAY = Path('/etc/web-panel-proxy-xray')
+CADDYFILE = Path('/etc/caddy/Caddyfile')
+SITE = Path('/srv/tproxy-site')
+UNITS = Path('/etc/systemd/system')
+CONTROL = Path(os.environ.get('WPP_CONTROL_DIR', '/var/lib/wpp-control'))
+TOKEN = CONTROL / 'agent.token'
+PANEL_ENV = PANEL_ETC / 'panel.env'
+INITIAL_PASSWORD = DATA_DIR / 'initial-admin-password'
+WRITABLE = [PANEL_ETC, DATA_DIR, RELAY, MTPROXY, XRAY, XRAY / 'tls', CADDYFILE.parent, SITE, UNITS, CONTROL]
+
+DOMAIN_RE = r'[a-z0-9]([a-z0-9.-]*[a-z0-9])?'
+EMAIL_RE = r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+DEFAULT_SITE_HTML = ('<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" '
+    'content="width=device-width,initial-scale=1"><title>Система подключения</title><style>body{margin:0;'
+    'min-height:100vh;display:grid;place-items:center;background:#05070b;color:#fff;font:16px system-ui}'
+    '.card{width:min(700px,88vw);padding:48px;text-align:center;border:1px solid #ffffff14;border-radius:28px;'
+    'background:#101722e8;box-shadow:0 30px 100px #0009}.ok{color:#65efad}h1{font-size:clamp(34px,6vw,58px)}'
+    '</style></head><body><div class="card"><div class="ok">● ONLINE</div><h1>Система подключения</h1>'
+    '<p>Безопасное соединение активно.</p></div></body></html>')
+
+
+def log(message):
+    print(f'[wpp-init] {message}', flush=True)
+
+
+def die(message):
+    print(f'[wpp-init] ERROR: {message}', file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+def write(path, text, mode):
+    path = Path(path)
+    tmp = path.with_name(path.name + '.wpp-init.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def env(name, default=''):
+    return os.environ.get(name, default).strip()
+
+
+def check_mounts():
+    for path in WRITABLE:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / '.wpp-write-test'
+            probe.write_text('ok')
+            probe.unlink()
+        except OSError as exc:
+            die(f'{path} is not writable for UID {os.getuid()} ({exc.strerror}). '
+                f'Run deploy/install.sh, or: chown -R 10000:10000 config data')
+
+
+def caddyfile(domain, email, panel_path, xray_path):
+    """The Caddyfile that install-panel.sh 2.3.6 produces from the tproxy template."""
+    s = (SHARE / 'Caddyfile.template').read_text(encoding='utf-8')
+    s = s.replace('{$TPROXY_HOSTNAME}', domain)
+    # Let's Encrypt does not require an account e-mail.
+    s = s.replace('{$ACME_EMAIL}', email) if email else re.sub(r'(?m)^\s*email \{\$ACME_EMAIL\}\n', '', s)
+    m = re.search(r'(?m)^\s*reverse_proxy 127\.0\.0\.1:8080\s*\{', s)
+    if not m:
+        die('Caddyfile template: relay reverse_proxy not found')
+    route = (
+        "    handle /wpp-api/* {\n        reverse_proxy 127.0.0.1:8090\n    }\n\n"
+        "    handle /wpp-sub/* {\n        reverse_proxy 127.0.0.1:8090\n    }\n\n"
+        f"    @web_panel_vless path {xray_path} {xray_path}/*\n"
+        "    handle @web_panel_vless {\n        reverse_proxy 127.0.0.1:10000 {\n"
+        "            transport http {\n                versions h2c\n            }\n"
+        "            flush_interval -1\n        }\n    }\n\n"
+        f"    handle {panel_path}/* {{\n        reverse_proxy 127.0.0.1:8090\n    }}\n\n")
+    s = s[:m.start()] + route + s[m.start():]
+    redirect = (f"# WPP HTTP REDIRECT BEGIN\nhttp://{domain} {{\n"
+                f"    redir https://{domain}{{uri}} permanent\n}}\n# WPP HTTP REDIRECT END\n")
+    return s.rstrip() + '\n\n' + redirect
+
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
+    return base64.b64encode(salt + digest).decode()
+
+
+def first_install():
+    domain = env('WPP_DOMAIN').lower()
+    email = env('WPP_ACME_EMAIL')
+    if not re.fullmatch(DOMAIN_RE, domain) or '.' not in domain or '..' in domain:
+        die('WPP_DOMAIN is missing or invalid (example: proxy.example.com)')
+    if email and not re.fullmatch(EMAIL_RE, email):
+        die('WPP_ACME_EMAIL is invalid')
+    public_host = env('WPP_PUBLIC_HOST') or domain
+    admin = env('WPP_ADMIN_USER') or 'admin'
+    password = env('WPP_ADMIN_PASSWORD')
+    generated = not password
+    if generated:
+        password = secrets.token_urlsafe(18)
+    elif len(password) < 12:
+        die('WPP_ADMIN_PASSWORD must contain at least 12 characters')
+    panel_path = env('WPP_PANEL_PATH') or '/panel-' + secrets.token_hex(16)
+    if not re.fullmatch(r'/panel-[a-z0-9-]{3,64}', panel_path):
+        die('WPP_PANEL_PATH must look like /panel-<letters, digits, dashes>')
+    log(f'first start: domain {domain}, MTProto host {public_host}')
+
+    secret = secrets.token_hex(16)
+    write(PANEL_ETC / 'primary-secret', secret + '\n', 0o600)
+    write(PANEL_ETC / 'mtproto-host', public_host + '\n', 0o600)
+    xray_path = '/vless-' + secrets.token_hex(12)
+    write(PANEL_ETC / 'xray-path', xray_path + '\n', 0o600)
+    write(PANEL_ENV, f'WEBPROXY_DOMAIN={domain}\nWEBPROXY_MTPROTO_HOST={public_host}\n'
+                     f'WEBPROXY_PANEL_PATH={panel_path}\n', 0o600)
+
+    # WEB relay: loopback only, as on a VPS; the profile limit is raised to 128.
+    write(RELAY / 'config.json', json.dumps({
+        'public_hostname': domain, 'listen': '127.0.0.1:8080', 'admin_listen': '127.0.0.1:8081',
+        'public_dir': str(SITE), 'profiles_file': str(RELAY / 'profiles.json'),
+        'limits': {'max_profiles': 128}}, indent=2) + '\n', 0o640)
+    write(RELAY / 'profiles.json', json.dumps({'profiles': [{
+        'name': 'default', 'secret': secret, 'backend': '127.0.0.1:2398', 'carrier_mode': 'https'}]}) + '\n', 0o400)
+
+    write(MTPROXY / 'mtproxy.env', f'MTPROXY_SECRET={secret}\nMTPROXY_WORKERS=1\nMTPROXY_MAX_CONNECTIONS=4096\n', 0o640)
+    subprocess.run(['/usr/local/sbin/refresh-mtproxy-config', '--init'], check=True)
+
+    for name in ('index.html', 'styles.css'):
+        write(SITE / name, (SHARE / 'site' / name).read_text(encoding='utf-8'), 0o640)
+
+    write(CADDYFILE, caddyfile(domain, email, panel_path, xray_path), 0o640)
+    try:
+        subprocess.run(['caddy', 'validate', '--config', str(CADDYFILE), '--adapter', 'caddyfile'],
+                       check=True, capture_output=True, text=True,
+                       env={**os.environ, 'XDG_DATA_HOME': '/tmp/caddy-validate', 'XDG_CONFIG_HOME': '/tmp/caddy-validate'})
+    except subprocess.CalledProcessError as exc:
+        die('generated Caddyfile is invalid: ' + (exc.stderr or exc.stdout)[-1500:])
+
+    write(DATA_FILE, json.dumps({'admin': {'user': admin, 'hash': hash_password(password)},
+                                 'site': {'html': DEFAULT_SITE_HTML}}, ensure_ascii=True, indent=2), 0o600)
+    import wpp_nodes
+    location = DATA_DIR / 'location.json'
+    if not location.exists():
+        wpp_nodes.save_location(str(location), {'country_code': 'UN', 'country_name': 'Сервер', 'name': 'Основная локация'})
+
+    url = f'https://{domain}{panel_path}/login'
+    write(DATA_DIR / 'panel-url', url + '\n', 0o600)
+    banner = ['=' * 64, f'  WEB PANEL PROXY {VERSION} is configured', f'  Panel:  {url}', f'  Login:  {admin}']
+    if generated:
+        write(INITIAL_PASSWORD, password + '\n', 0o600)
+        banner.append(f'  Password: {password}')
+        banner.append(f'  (also saved to data/panel/{INITIAL_PASSWORD.name}; delete it after the first login)')
+    else:
+        banner.append('  Password: WPP_ADMIN_PASSWORD from .env (remove it from .env after the first login)')
+    banner.append('=' * 64)
+    print('\n'.join(banner), flush=True)
+
+
+def check_settings():
+    stored = dict(line.split('=', 1) for line in PANEL_ENV.read_text(encoding='utf-8').splitlines() if '=' in line)
+    domain = env('WPP_DOMAIN').lower()
+    if domain and domain != stored.get('WEBPROXY_DOMAIN'):
+        log(f'WARNING: WPP_DOMAIN={domain} differs from the configured {stored.get("WEBPROXY_DOMAIN")}; '
+            'the configured domain is kept. A new domain needs a fresh config directory.')
+
+
+def main():
+    check_mounts()
+    try:
+        grp.getgrnam('xray')
+    except KeyError:
+        die('the image is missing its service groups')
+    if not DATA_FILE.exists():
+        first_install()
+    else:
+        check_settings()
+    write(PANEL_ETC / 'version', VERSION + '\n', 0o600)
+    if not TOKEN.exists():
+        write(TOKEN, secrets.token_hex(32) + '\n', 0o600)
+        log('agent token created')
+
+
+if __name__ == '__main__':
+    main()

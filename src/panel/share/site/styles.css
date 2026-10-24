@@ -1,0 +1,26 @@
+/* WEB PANEL PROXY default public CSS */
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+body{min-height:100vh;display:grid;place-items:center;overflow:hidden;color:#f5f7ff;background:#05070d}
+.bg{position:fixed;inset:0;overflow:hidden;background:
+radial-gradient(circle at 15% 20%,rgba(72,190,255,.16),transparent 30%),
+radial-gradient(circle at 85% 80%,rgba(125,92,255,.18),transparent 32%),
+linear-gradient(135deg,#04060b,#090e18 50%,#05070d)}
+.bg:before{content:"";position:absolute;inset:-45%;
+background:conic-gradient(from 90deg,transparent,rgba(75,210,255,.09),transparent 30%,rgba(139,92,246,.09),transparent 65%);
+animation:spin 18s linear infinite}
+.bg:after{content:"";position:absolute;inset:0;background-image:radial-gradient(rgba(255,255,255,.35) 1px,transparent 1px);background-size:42px 42px;opacity:.12;animation:drift 20s linear infinite}
+.card{position:relative;width:min(680px,calc(100% - 32px));padding:44px 34px 30px;text-align:center;border:1px solid rgba(255,255,255,.11);border-radius:28px;background:rgba(10,14,24,.72);backdrop-filter:blur(22px);box-shadow:0 30px 90px rgba(0,0,0,.48),inset 0 1px rgba(255,255,255,.07);animation:enter .8s cubic-bezier(.2,.8,.2,1) both}
+.logo{width:78px;height:78px;margin:0 auto 22px;border-radius:24px;display:grid;place-items:center;font-size:34px;background:linear-gradient(135deg,#56d7ff,#7568ff);box-shadow:0 0 45px rgba(86,180,255,.3);animation:float 4s ease-in-out infinite}
+h1{margin:0;font-size:clamp(30px,6vw,48px);letter-spacing:-1.8px}
+p{margin:14px auto 0;max-width:520px;color:#98a3b7;font-size:16px;line-height:1.65}
+.status{display:inline-flex;align-items:center;gap:9px;margin-top:24px;padding:10px 15px;border:1px solid rgba(255,255,255,.08);border-radius:999px;background:rgba(255,255,255,.035);color:#cdd5e5;font-size:14px}
+.dot{width:8px;height:8px;border-radius:50%;background:#63f5b0;box-shadow:0 0 15px #63f5b0;animation:pulse 1.7s infinite}
+.line{height:1px;margin:28px 0 20px;background:linear-gradient(90deg,transparent,rgba(255,255,255,.12),transparent)}
+.footer{font-size:12px;color:#596579}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes drift{to{transform:translate3d(42px,42px,0)}}
+@keyframes enter{from{opacity:0;transform:translateY(24px) scale(.97)}to{opacity:1;transform:none}}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+@keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.35);opacity:.65}}
+@media(max-width:520px){.card{padding:34px 22px 26px;border-radius:22px}.logo{width:68px;height:68px}}

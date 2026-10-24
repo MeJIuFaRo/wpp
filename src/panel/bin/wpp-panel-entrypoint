@@ -1,0 +1,6 @@
+#!/bin/sh
+# Panel container: create the configuration on first start, then supervise
+# the panel and its periodic jobs with the agent.
+set -e
+python3 /usr/local/sbin/wpp-init
+exec python3 /usr/local/lib/wpp/wpp_agent.py

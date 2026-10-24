@@ -1,0 +1,12 @@
+[Unit]
+Description=Browser HTTPS transport relay
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tproxy-server -config /etc/tproxy-server/config.json
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

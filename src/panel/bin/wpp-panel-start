@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# ExecStart of tproxy-panel.service in Docker. After the first start of a new
+# image version it applies the stored users to all containers (what
+# install-panel.sh did with `web-proxy-panelctl init`), then runs the panel.
+set -uo pipefail
+MARKER="/var/lib/tproxy-panel/.applied-${WPP_VERSION:-unknown}"
+
+wait_agents() {
+    local port unit deadline=$((SECONDS + 180))
+    # One unit per container; `show` succeeds once that agent answers.
+    for unit in tproxy-server.service mtproxy.service web-panel-proxy-mtproto.service \
+                web-panel-proxy-xray.service web-panel-proxy-openflux.service; do
+        until systemctl show -p ActiveState --value "$unit" 2>/dev/null | grep -qv '^unknown$'; do
+            (( SECONDS < deadline )) || { echo "[panel-start] agent for $unit did not answer" >&2; return 1; }
+            sleep 2
+        done
+    done
+}
+
+apply_once() {
+    if wait_agents; then
+        python3 - <<'PY' || echo "[panel-start] OpenFlux service was not installed" >&2
+import sys
+sys.path.insert(0, "/opt/tproxy-panel")
+import wpp_openflux
+wpp_openflux.install_service()
+wpp_openflux.restore_if_configured()
+PY
+        systemctl enable web-panel-proxy-openflux.service >/dev/null || true
+        if /usr/local/sbin/web-proxy-panelctl init; then
+            : > "$MARKER"
+            echo "[panel-start] users and services applied for ${WPP_VERSION:-unknown}"
+        else
+            echo "[panel-start] web-proxy-panelctl init failed; it is retried on the next start" >&2
+        fi
+        # Hysteria2 needs the certificate as soon as Caddy has it.
+        /usr/local/sbin/web-panel-proxy-sync-tls >/dev/null 2>&1 || true
+    fi
+}
+
+# The panel starts at once; on a small VPS the first apply takes a while.
+[[ -e "$MARKER" ]] || apply_once &
+exec python3 /opt/tproxy-panel/panel.py

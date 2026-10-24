@@ -1,0 +1,4 @@
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+Unit=web-panel-proxy-sync-tls.service

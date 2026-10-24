@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""systemctl/journalctl for the panel container (installed under both names).
+
+The panel code calls systemctl exactly as on a VPS. Each unit belongs to one
+container agent (see AGENTS); the request goes to that agent over loopback.
+Caddy has no agent: it reloads its Caddyfile by itself (`caddy run --watch`).
+"""
+import json
+import os
+import socket
+import sys
+import urllib.error
+import urllib.request
+from fnmatch import fnmatchcase
+from pathlib import Path
+
+CONTROL = Path(os.environ.get('WPP_CONTROL_DIR', '/var/lib/wpp-control'))
+# Keep in sync with WPP_AGENT_UNITS / WPP_AGENT_PORT of each image.
+AGENTS = [
+    (9100, ['tproxy-panel.service', 'web-proxy-panel-traffic.*', 'web-panel-proxy-metrics.*',
+            'web-panel-proxy-sync-tls.*', 'refresh-mtproxy-config.*']),
+    (9101, ['tproxy-server.service']),
+    (9102, ['mtproxy.service', 'web-proxy-user-*.service']),
+    (9103, ['web-panel-proxy-mtproto.service']),
+    (9104, ['web-panel-proxy-xray.service']),
+    (9105, ['web-panel-proxy-openflux.service', 'web-panel-proxy-openflux-*.service']),
+]
+# Units that existed on a VPS for host integration only; inside the containers
+# they have nothing to do and always report success.
+NOOP = ['web-proxy-panel-firewall.service', 'tproxy-firewall.service', 'nftables.service']
+UNSUPPORTED = {'web-panel-proxy-web-update.service':
+               'Updates are installed with `docker compose pull && docker compose up -d` on the host.'}
+
+
+def normalise(unit):
+    return unit if '.' in unit else unit + '.service'
+
+
+def agent_port(unit):
+    for port, patterns in AGENTS:
+        if any(fnmatchcase(unit, p) for p in patterns):
+            return port
+    return None
+
+
+def call(port, path, payload, timeout=120):
+    try:
+        token = (CONTROL / 'agent.token').read_text(encoding='ascii').strip()
+    except OSError:
+        return 1, {'error': 'agent token is missing'}
+    request = urllib.request.Request(
+        f'http://127.0.0.1:{port}{path}', data=json.dumps(payload).encode(), method='POST',
+        headers={'Content-Type': 'application/json', 'X-WPP-Token': token})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return 0, json.loads(response.read() or b'{}')
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read() or b'{}')
+        except ValueError:
+            body = {}
+        return (4 if exc.code == 404 else 1), body
+    except (urllib.error.URLError, socket.timeout, ConnectionError, OSError):
+        return 1, {'error': f'agent on 127.0.0.1:{port} is not reachable'}
+
+
+def caddy_listening():
+    try:
+        with socket.create_connection(('127.0.0.1', 443), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def properties(unit):
+    """Return a property dict, or None when the unit does not exist."""
+    if unit == 'caddy.service':
+        active = caddy_listening()
+        return {'Id': unit, 'ActiveState': 'active' if active else 'inactive',
+                'SubState': 'running' if active else 'dead', 'User': 'caddy', 'MainPID': '0',
+                'MemoryCurrent': '[not set]', 'TasksCurrent': '[not set]',
+                'ExecMainStartTimestampMonotonic': '0', 'Result': 'success'}
+    if unit in NOOP:
+        return {'Id': unit, 'ActiveState': 'active', 'SubState': 'exited', 'MainPID': '0', 'Result': 'success'}
+    port = agent_port(unit)
+    if port is None:
+        return None
+    code, body = call(port, '/v1/action', {'verb': 'show', 'unit': unit}, timeout=10)
+    if code == 4:
+        return None
+    if code:
+        return {'Id': unit, 'ActiveState': 'unknown', 'SubState': 'unknown', 'MainPID': '0'}
+    return body.get('properties', {})
+
+
+def systemctl(argv):
+    options, args = {}, []
+    quiet = value_only = False
+    wanted = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ('-q', '--quiet'):
+            quiet = True
+        elif a == '--value':
+            value_only = True
+        elif a in ('-p', '--property'):
+            i += 1
+            wanted += argv[i].split(',')
+        elif a.startswith('--property='):
+            wanted += a.split('=', 1)[1].split(',')
+        elif a == '--now':
+            options['now'] = True
+        elif a.startswith('--signal=') or a.startswith('-s'):
+            options['signal'] = a.split('=', 1)[1] if '=' in a else argv[i + 1]
+            if '=' not in a:
+                i += 1
+        elif a.startswith('-'):
+            pass  # --no-pager, --full, --no-block, --kill-who=main, --no-legend ...
+        else:
+            args.append(a)
+        i += 1
+    if not args:
+        print('systemctl: missing verb', file=sys.stderr)
+        return 1
+    verb, units = args[0], [normalise(u) for u in args[1:]]
+
+    if verb == 'daemon-reload':
+        for port, _ in AGENTS:
+            call(port, '/v1/action', {'verb': 'daemon-reload'}, timeout=30)
+        return 0
+
+    if verb in ('show', 'is-active', 'status'):
+        rc = 0
+        for unit in units:
+            props = properties(unit)
+            if props is None:
+                if verb == 'show':
+                    props = {'Id': unit, 'ActiveState': 'inactive', 'SubState': 'dead', 'LoadState': 'not-found'}
+                else:
+                    if not quiet:
+                        print('inactive' if verb == 'is-active' else f'Unit {unit} could not be found.')
+                    rc = 4 if verb == 'status' else 3
+                    continue
+            state = props.get('ActiveState', 'unknown')
+            if verb == 'is-active':
+                if not quiet:
+                    print(state)
+                rc = rc or (0 if state == 'active' else 3)
+            elif verb == 'show':
+                keys = wanted or sorted(props)
+                for key in keys:
+                    value = props.get(key, '')
+                    print(value if value_only else f'{key}={value}')
+            else:
+                print(f"● {unit} - {props.get('Description', '')}")
+                print(f"     Active: {state} ({props.get('SubState', '')})")
+                if props.get('MainPID', '0') != '0':
+                    print(f"   Main PID: {props['MainPID']}")
+                port = agent_port(unit)
+                if port:
+                    _, body = call(port, '/v1/action', {'verb': 'logs', 'unit': unit, 'options': {'n': 10}}, timeout=10)
+                    for line in body.get('lines', []):
+                        print(line)
+                rc = rc or (0 if state == 'active' else 3)
+        return rc
+
+    if verb == 'is-enabled':
+        rc = 0
+        for unit in units:
+            port = agent_port(unit)
+            enabled = unit == 'caddy.service' or unit in NOOP
+            if port:
+                code, body = call(port, '/v1/action', {'verb': 'is-enabled', 'unit': unit}, timeout=10)
+                enabled = code == 0 and body.get('enabled')
+            if not quiet:
+                print('enabled' if enabled else 'disabled')
+            rc = rc or (0 if enabled else 1)
+        return rc
+
+    if verb == 'list-unit-files':
+        for unit in units:
+            if properties(unit) is not None:
+                print(f'{unit} enabled enabled')
+        return 0
+
+    rc = 0
+    for unit in units:
+        if unit in UNSUPPORTED:
+            print(UNSUPPORTED[unit], file=sys.stderr)
+            rc = 1
+            continue
+        if unit in NOOP or unit == 'caddy.service':
+            continue  # caddy reloads on Caddyfile change; restart = reload
+        port = agent_port(unit)
+        if port is None:
+            if verb not in ('reset-failed', 'stop', 'disable'):
+                print(f'Failed to {verb} {unit}: Unit {unit} not found.', file=sys.stderr)
+                rc = 5
+            continue
+        code, body = call(port, '/v1/action', {'verb': verb, 'unit': unit, 'options': options})
+        if code:
+            print(body.get('error') or f'Failed to {verb} {unit}.', file=sys.stderr)
+            rc = 5 if code == 4 else 1
+    return rc
+
+
+def journalctl(argv):
+    unit, lines = None, 50
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ('-u', '--unit'):
+            i += 1
+            unit = normalise(argv[i])
+        elif a.startswith('--unit='):
+            unit = normalise(a.split('=', 1)[1])
+        elif a in ('-n', '--lines'):
+            i += 1
+            lines = int(argv[i])
+        elif a.startswith('--lines='):
+            lines = int(a.split('=', 1)[1])
+        elif a in ('--since', '--until', '-o', '--output'):
+            i += 1
+        i += 1
+    port = agent_port(unit) if unit else None
+    if port is None:
+        print('-- No entries --')
+        return 0
+    code, body = call(port, '/v1/action', {'verb': 'logs', 'unit': unit, 'options': {'n': lines}}, timeout=10)
+    for line in body.get('lines', []) or ['-- No entries --']:
+        print(line)
+    return 0
+
+
+if __name__ == '__main__':
+    tool = os.path.basename(sys.argv[0])
+    sys.exit(journalctl(sys.argv[1:]) if tool == 'journalctl' else systemctl(sys.argv[1:]))

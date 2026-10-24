@@ -1,0 +1,4 @@
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1d
+Unit=refresh-mtproxy-config.service

@@ -1,0 +1,12 @@
+upstream/
+build/
+deploy/config/
+deploy/data/
+deploy/.env
+__pycache__/
+*.pyc
+work/
+downloads/*
+!downloads/README
+PLAN.md
+scripts/scan-patterns.local

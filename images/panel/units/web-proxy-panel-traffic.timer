@@ -1,0 +1,4 @@
+[Timer]
+OnActiveSec=5s
+OnUnitInactiveSec=10s
+Unit=web-proxy-panel-traffic.service

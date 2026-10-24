@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Start MTProxy with --nat-info inside Docker.
+
+Telegram's middle-end servers check the proxy's own address during the RPC
+handshake. Behind Docker NAT the proxy sees only its container address, every
+handshake fails and MTProxy reconnects in a tight loop (thousands of
+connections, which can fill the host's conntrack table). --nat-info maps the
+container address to the public one.
+
+The public IPv4 comes from WPP_PUBLIC_IP, else it is detected once per
+container (https://api.ipify.org, as the 2.3.6 installer did) and cached.
+"""
+import ipaddress
+import os
+import socket
+import sys
+import urllib.request
+
+REAL = '/opt/MTProxy/objs/bin/mtproto-proxy.real'
+CACHE = '/tmp/wpp-public-ip'
+
+
+def ipv4(value):
+    try:
+        return str(ipaddress.IPv4Address(value.strip()))
+    except ValueError:
+        return ''
+
+
+def local_address():
+    # No packet is sent: connect() on UDP only selects the outgoing address.
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(('192.0.2.1', 9))
+        return s.getsockname()[0]
+
+
+def public_address():
+    value = ipv4(os.environ.get('WPP_PUBLIC_IP', ''))
+    if value:
+        return value
+    try:
+        with open(CACHE, encoding='ascii') as f:
+            value = ipv4(f.read())
+        if value:
+            return value
+    except OSError:
+        pass
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open('https://api.ipify.org', timeout=10) as response:
+            value = ipv4(response.read(64).decode('ascii', 'replace'))
+    except Exception:
+        value = ''
+    if value:
+        try:
+            with open(CACHE, 'w', encoding='ascii') as f:
+                f.write(value)
+        except OSError:
+            pass
+    return value
+
+
+args = sys.argv[1:]
+if '--nat-info' not in args:
+    try:
+        inside, outside = local_address(), public_address()
+    except OSError:
+        inside = outside = ''
+    if inside and outside and inside != outside:
+        args = ['--nat-info', f'{inside}:{outside}'] + args
+    else:
+        print('wpp: public IPv4 unknown, starting MTProxy without --nat-info '
+              '(set WPP_PUBLIC_IP in .env)', file=sys.stderr, flush=True)
+os.execv(REAL, [REAL] + args)

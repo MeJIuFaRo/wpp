@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Download Telegram's MTProxy secret/config (tproxy-server deploy scripts).
+#   refresh-mtproxy-config          daily: refresh proxy-multi.conf, restart the
+#                                   primary backend if it changed (as upstream)
+#   refresh-mtproxy-config --init   first start: fetch both files, no restarts
+set -Eeuo pipefail
+DIR=/etc/mtproxy
+fetch() { # <url> <file>
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --retry 3 --connect-timeout 20 --output "$2" "$1"
+}
+umask 077
+if [[ "${1:-}" == "--init" ]]; then
+    secret="$(mktemp "$DIR/proxy-secret.XXXXXX")"
+    trap 'rm -f "$secret"' EXIT
+    fetch https://core.telegram.org/getProxySecret "$secret"
+    test "$(wc -c < "$secret")" -eq 128
+    chmod 0640 "$secret"
+    mv -f "$secret" "$DIR/proxy-secret"
+    trap - EXIT
+fi
+config="$(mktemp "$DIR/proxy-multi.conf.XXXXXX")"
+trap 'rm -f "$config"' EXIT
+fetch https://core.telegram.org/getProxyConfig "$config"
+test "$(wc -c < "$config")" -ge 100
+grep -q '^default ' "$config"
+grep -q '^proxy_for ' "$config"
+chmod 0640 "$config"
+if [[ -e "$DIR/proxy-multi.conf" ]] && cmp -s "$config" "$DIR/proxy-multi.conf"; then
+    exit 0
+fi
+mv -f "$config" "$DIR/proxy-multi.conf"
+trap - EXIT
+[[ "${1:-}" == "--init" ]] || systemctl try-restart mtproxy.service

@@ -1,0 +1,272 @@
+diff -ruN a/internal/config/config.go b/internal/config/config.go
+--- a/internal/config/config.go	2026-09-23 14:57:04.000000000 +0300
++++ b/internal/config/config.go	2026-10-03 20:39:30.000000000 +0300
+@@ -437,6 +437,11 @@
+ 	return nil
+ }
+ 
++// ReloadProfiles validates only the credential file against the running settings.
++func (c Config) ReloadProfiles() ([]Profile, error) {
++	return loadProfiles(c.ProfilesFile, c.PublicHostname, c.Limits)
++}
++
+ func loadProfiles(path, host string, limits Limits) ([]Profile, error) {
+ 	info, err := os.Stat(path)
+ 	if err != nil {
+diff -ruN a/internal/server/reload_test.go b/internal/server/reload_test.go
+--- a/internal/server/reload_test.go	1970-01-01 03:00:00.000000000 +0300
++++ b/internal/server/reload_test.go	2026-10-03 20:39:30.000000000 +0300
+@@ -0,0 +1,102 @@
++package server
++
++import (
++	"encoding/hex"
++	"fmt"
++	"github.com/telegramdesktop/tproxy-server/internal/config"
++	"github.com/telegramdesktop/tproxy-server/internal/frame"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestReloadPreservesOpenStreamAndRejectsInvalidFile(t *testing.T) {
++	backend := startEchoBackend(t)
++	file := filepath.Join(t.TempDir(), "profiles.json")
++	app, _ := newConfiguredTestServer(t, backend, func(c *config.Config) { c.ProfilesFile = file })
++	defer app.Shutdown()
++	hosted := httptest.NewServer(app.Handler())
++	defer hosted.Close()
++	admin := httptest.NewServer(app.AdminHandler())
++	defer admin.Close()
++	create := func(p config.Profile) string {
++		bootstrap, err := app.manager.IssueBootstrap(&p, "127.0.0.1")
++		if err != nil {
++			t.Fatal(err)
++		}
++		r := perform(t, hosted.Client(), apiRequest(t, "POST", hosted.URL+"/api/v1/session", bootstrap, frame.Encode(frame.Hello, 0, []byte{1})))
++		readResponse(t, r)
++		if r.StatusCode != 200 {
++			t.Fatal(r.StatusCode)
++		}
++		return r.Header.Get("X-Session-Token")
++	}
++	old := app.manager.Profiles()[0]
++	token := create(old)
++	cursor := "0"
++	exchange := func(seq int, open bool) {
++		payload := []byte(fmt.Sprintf("same-stream-%d", seq))
++		body := frame.Encode(frame.Data, 17, payload)
++		if open {
++			body = append(frame.Encode(frame.Open, 17, nil), body...)
++		}
++		req := apiRequest(t, "POST", hosted.URL+"/api/v1/up", token, body)
++		req.Header.Set("X-Up-Seq", fmt.Sprint(seq))
++		r := perform(t, hosted.Client(), req)
++		readResponse(t, r)
++		if r.StatusCode != 204 {
++			t.Fatal(r.StatusCode)
++		}
++		_, _, cursor = pollForData(t, hosted.Client(), hosted.URL, token, cursor, map[uint32][]byte{17: payload})
++	}
++	reload := func(status int) {
++		req, _ := http.NewRequest("POST", admin.URL+"/profiles/reload", nil)
++		req.Header.Set("X-WPP-Reload", "1")
++		r := perform(t, admin.Client(), req)
++		readResponse(t, r)
++		if r.StatusCode != status {
++			t.Fatalf("reload %d want %d", r.StatusCode, status)
++		}
++	}
++	first := fmt.Sprintf(`{"name":"default","secret":"000102030405060708090a0b0c0d0e0f","backend":%q}`, backend)
++	second := fmt.Sprintf(`{"name":"new","secret":"101112131415161718191a1b1c1d1e1f","backend":%q}`, backend)
++	write := func(s string) {
++		if err := os.WriteFile(file, []byte(s), 0600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	exchange(1, true)
++	write(`{"profiles":[` + first + `,` + second + `]}`)
++	reload(204)
++	exchange(2, false)
++	secret, _ := hex.DecodeString("101112131415161718191a1b1c1d1e1f")
++	cap := config.DeriveCapability(testHost, secret)
++	p := app.manager.MatchCapability(cap[:])
++	if p == nil {
++		t.Fatal("new key absent")
++	}
++	newToken := create(*p)
++	write(`{"profiles":[BROKEN]}`)
++	reload(400)
++	exchange(3, false)
++	if app.manager.MatchCapability(cap[:]) == nil {
++		t.Fatal("invalid reload changed profiles")
++	}
++	write(`{"profiles":[` + first + `]}`)
++	reload(204)
++	exchange(4, false)
++	if app.manager.MatchCapability(cap[:]) != nil {
++		t.Fatal("removed capability still accepted")
++	}
++	if _, err := app.manager.Get(newToken); err == nil {
++		t.Fatal("removed profile session still active")
++	}
++	req, _ := http.NewRequest("POST", admin.URL+"/profiles/reload", nil)
++	r := perform(t, admin.Client(), req)
++	readResponse(t, r)
++	if r.StatusCode != 403 {
++		t.Fatal("missing reload header accepted")
++	}
++}
+diff -ruN a/internal/server/server.go b/internal/server/server.go
+--- a/internal/server/server.go	2026-09-23 14:57:04.000000000 +0300
++++ b/internal/server/server.go	2026-10-03 20:39:30.000000000 +0300
+@@ -15,6 +15,7 @@
+ 	"net/url"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/gorilla/websocket"
+@@ -41,6 +42,7 @@
+ const bodyReadDeadline = 30 * time.Second
+ 
+ type Server struct {
++	reloadMu         sync.Mutex
+ 	config           config.Config
+ 	manager          *session.Manager
+ 	site             *staticSite
+@@ -96,6 +98,7 @@
+ 		_, _ = io.WriteString(w, "ok\n")
+ 	})
+ 	mux.HandleFunc("/readyz", s.serveReady)
++	mux.HandleFunc("/profiles/reload", s.serveReloadProfiles)
+ 	mux.HandleFunc("/metrics", s.serveMetrics)
+ 	if s.config.EnablePprof {
+ 		mux.HandleFunc("/debug/pprof/", pprof.Index)
+@@ -107,6 +110,34 @@
+ 	return mux
+ }
+ 
++// Admin listener is loopback-only; reject browser-originated state changes too.
++func (s *Server) serveReloadProfiles(w http.ResponseWriter, r *http.Request) {
++	host, _, err := net.SplitHostPort(r.RemoteAddr)
++	ip := net.ParseIP(host)
++	if err != nil || ip == nil || !ip.IsLoopback() || r.Header.Get("Origin") != "" || r.Header.Get("X-WPP-Reload") != "1" {
++		http.Error(w, "forbidden", http.StatusForbidden)
++		return
++	}
++	if r.Method != http.MethodPost {
++		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
++		http.Error(w, "body not allowed", http.StatusBadRequest)
++		return
++	}
++	s.reloadMu.Lock()
++	defer s.reloadMu.Unlock()
++	profiles, err := s.config.ReloadProfiles()
++	if err != nil {
++		http.Error(w, "invalid profiles; running profiles unchanged", http.StatusBadRequest)
++		return
++	}
++	s.manager.ReloadProfiles(profiles)
++	w.Header().Set("Cache-Control", "no-store")
++	w.WriteHeader(http.StatusNoContent)
++}
++
+ func (s *Server) Shutdown() {
+ 	s.manager.Shutdown()
+ }
+@@ -734,7 +765,7 @@
+ 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+ 		return
+ 	}
+-	for _, profile := range s.config.Profiles {
++	for _, profile := range s.manager.Profiles() {
+ 		connection, err := net.DialTimeout("tcp", profile.Backend, s.config.Timeouts.BackendDial.Value())
+ 		if err != nil {
+ 			http.Error(w, "backend unavailable", http.StatusServiceUnavailable)
+diff -ruN a/internal/session/manager.go b/internal/session/manager.go
+--- a/internal/session/manager.go	2026-09-23 14:57:04.000000000 +0300
++++ b/internal/session/manager.go	2026-10-03 20:39:30.000000000 +0300
+@@ -123,7 +123,54 @@
+ 	return result
+ }
+ 
++func (m *Manager) Profiles() []config.Profile {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	return append([]config.Profile(nil), m.config.Profiles...)
++}
++
++// Replace immutable profile snapshots; preserve every unchanged session and stream.
++func (m *Manager) ReloadProfiles(profiles []config.Profile) {
++	profiles = append([]config.Profile(nil), profiles...)
++	for i := range profiles {
++		profiles[i].CarrierMode = profiles[i].CarrierMode.WithDefault()
++		profiles[i].Limits = profiles[i].Limits.WithDefaults(m.config.Limits)
++	}
++	same := func(p *config.Profile) bool {
++		for i := range profiles {
++			if profiles[i] == *p {
++				return true
++			}
++		}
++		return false
++	}
++	m.mu.Lock()
++	m.config.Profiles = profiles
++	for hash, entry := range m.bootstraps {
++		if !same(entry.profile) {
++			m.removeBootstrapLocked(hash, entry)
++		}
++	}
++	var closeSessions []*Session
++	for _, s := range m.sessions {
++		if !same(s.profile) {
++			closeSessions = append(closeSessions, s)
++		}
++	}
++	m.mu.Unlock()
++	// Close callbacks take m.mu, so never close while holding that lock.
++	for _, s := range closeSessions {
++		s.Close()
++	}
++}
++
+ func (m *Manager) MatchCapability(value []byte) *config.Profile {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	return m.matchCapabilityLocked(value)
++}
++
++func (m *Manager) matchCapabilityLocked(value []byte) *config.Profile {
+ 	if len(value) != sha256.Size {
+ 		return nil
+ 	}
+@@ -144,10 +191,6 @@
+ 	if profile == nil {
+ 		return "", ErrAuthentication
+ 	}
+-	profile = m.MatchCapability(profile.Capability[:])
+-	if profile == nil {
+-		return "", ErrAuthentication
+-	}
+ 	now := time.Now()
+ 	token, hash, err := newToken()
+ 	if err != nil {
+@@ -158,6 +201,10 @@
+ 	if m.closed {
+ 		return "", ErrClosed
+ 	}
++	profile = m.matchCapabilityLocked(profile.Capability[:])
++	if profile == nil {
++		return "", ErrAuthentication
++	}
+ 	m.removeExpiredBootstrapsLocked(now)
+ 	if (m.config.Limits.MaxBootstrapsPerIP != 0 &&
+ 		m.bootstrapsPerIP[clientIP] >= m.config.Limits.MaxBootstrapsPerIP) || !allowRateLocked(

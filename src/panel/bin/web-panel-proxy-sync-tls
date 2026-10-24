@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Copy Caddy's certificate for the panel domain to Xray (Hysteria2 needs it).
+# Docker version of the script from install-panel.sh 2.3.6: the domain comes
+# from WEBPROXY_DOMAIN or panel.env, Caddy's storage is mounted read-only at
+# /var/lib/caddy/.local/share/caddy, and files keep the container account.
+set -Eeuo pipefail
+MODE="${1:-sync}"
+[[ "$MODE" == "sync" || "$MODE" == "--maintain" || "$MODE" == "--force" ]] || {
+    echo "Usage: web-panel-proxy-sync-tls [--maintain|--force]" >&2
+    exit 2
+}
+exec 8>/run/lock/web-panel-proxy-tls.lock
+flock -w 15 8 || { echo "Another TLS check is still running" >&2; exit 1; }
+DOMAIN="${WEBPROXY_DOMAIN:-$(sed -n 's/^WEBPROXY_DOMAIN=//p' /etc/web-proxy-panel/panel.env 2>/dev/null | head -n1)}"
+[[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || { echo "Invalid WEB Proxy domain" >&2; exit 1; }
+DEST_DIR="/etc/web-panel-proxy-xray/tls"
+DEST_CERT="$DEST_DIR/domain.crt"
+DEST_KEY="$DEST_DIR/domain.key"
+STORE="/var/lib/caddy/.local/share/caddy/certificates"
+LIVE_CERT="$(mktemp /tmp/wpp-live-certificate.XXXXXX)"
+trap 'rm -f "$LIVE_CERT"' EXIT
+
+read_live_certificate() {
+    : > "$LIVE_CERT"
+    timeout 12 openssl s_client -connect 127.0.0.1:443 -servername "$DOMAIN" </dev/null 2>/dev/null |
+        openssl x509 -outform PEM -out "$LIVE_CERT" 2>/dev/null
+}
+
+if [[ "$MODE" != "sync" ]]; then
+    # Caddy renews certificates by itself; here we only wait for a valid one.
+    renewed=0
+    for _ in $(seq 1 24); do
+        if read_live_certificate && openssl x509 -in "$LIVE_CERT" -noout -checkend 0 >/dev/null 2>&1; then
+            renewed=1
+            break
+        fi
+        [[ "$MODE" == "--force" ]] || break
+        sleep 5
+    done
+    [[ "$renewed" == 1 ]] || { echo "Caddy did not provide a valid TLS certificate for $DOMAIN" >&2; exit 1; }
+    echo "TLS certificate: $(openssl x509 -in "$LIVE_CERT" -noout -enddate | cut -d= -f2-)"
+fi
+
+SOURCE_CERT=""
+SOURCE_KEY=""
+if [[ -d "$STORE" ]]; then
+    while IFS= read -r candidate; do
+        key="${candidate%.crt}.key"
+        [[ -s "$key" ]] || continue
+        if openssl x509 -in "$candidate" -noout -checkend 86400 >/dev/null 2>&1; then
+            SOURCE_CERT="$candidate"
+            SOURCE_KEY="$key"
+            break
+        fi
+    done < <(timeout 12 find "$STORE" -xdev -type f -path "*/${DOMAIN}/${DOMAIN}.crt" -print 2>/dev/null || true)
+fi
+[[ -n "$SOURCE_CERT" && -n "$SOURCE_KEY" ]] || { echo "Caddy TLS certificate for $DOMAIN was not found" >&2; exit 1; }
+CERT_PUB="$(timeout 10 openssl x509 -in "$SOURCE_CERT" -pubkey -noout | openssl sha256)"
+KEY_PUB="$(timeout 10 openssl pkey -in "$SOURCE_KEY" -pubout 2>/dev/null | openssl sha256)"
+[[ -n "$CERT_PUB" && "$CERT_PUB" == "$KEY_PUB" ]] || { echo "Caddy certificate/private key mismatch" >&2; exit 1; }
+install -d -g xray -m 0750 "$DEST_DIR"
+changed=0
+if ! cmp -s "$SOURCE_CERT" "$DEST_CERT" 2>/dev/null; then
+    install -g xray -m 0640 "$SOURCE_CERT" "$DEST_CERT"
+    changed=1
+fi
+if ! cmp -s "$SOURCE_KEY" "$DEST_KEY" 2>/dev/null; then
+    install -g xray -m 0640 "$SOURCE_KEY" "$DEST_KEY"
+    changed=1
+fi
+if [[ "$changed" == 1 ]] && systemctl is-active --quiet web-panel-proxy-xray.service; then
+    [[ "$MODE" == "sync" ]] || echo "Applying the renewed certificate to Hysteria2..."
+    timeout 45 systemctl try-restart web-panel-proxy-xray.service || {
+        echo "Xray did not restart within 45 seconds" >&2
+        exit 1
+    }
+fi
+[[ "$MODE" == "sync" ]] || echo "TLS maintenance completed."

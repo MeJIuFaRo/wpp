@@ -1,0 +1,6 @@
+Optional cache of release files for the image builds. A Dockerfile uses a
+file from here when it exists and downloads it otherwise; the SHA-256 from
+versions.env is checked in both cases.
+
+  Xray-linux-64-<XRAY_VERSION>.zip
+  openflux-linux-amd64-<OPENFLUX_VERSION>
