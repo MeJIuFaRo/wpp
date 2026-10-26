@@ -19,12 +19,15 @@ URL_FILE = CONFIG_DIR / "document-url"
 KEY_FILE = CONFIG_DIR / "encryption-key"
 ENABLED_FILE = CONFIG_DIR / "enabled"
 BIN = Path("/opt/web-panel-proxy/openflux/openflux")
+# Writable state of the exit node (cookie jar). The core writes its cookies
+# to the working directory by default; in Docker that is a read-only "/".
+STATE_DIR = Path("/var/lib/wpp-openflux")
 UNIT = Path("/etc/systemd/system/web-panel-proxy-openflux.service")
 SERVICE = "web-panel-proxy-openflux.service"
 SERVICE_USER = "wpp-openflux"
 LEGACY_IOS_DROPIN = Path("/etc/systemd/system/web-panel-proxy-openflux.service.d/ios.conf")
 PROFILES_DIR = CONFIG_DIR / "profiles"
-VERSION = "1.0.0"
+VERSION = "0.13.0"
 MAX_OPENFLUX_PROFILES = 32
 TRANSPORT = "yandex"
 CODEC = "batched"
@@ -129,9 +132,18 @@ def _write_private_files(config):
             pass
 
 
+def _exec_start(state_dir, url_file, encryption):
+    # Each profile keeps its own cookie jar; the shell creates the directory
+    # and runs the core inside it, so nothing is written elsewhere.
+    return (f"/bin/sh -c 'mkdir -p {state_dir} && cd {state_dir} && exec {BIN} --role=exit --mode={MODE} "
+            f"--codec={CODEC} --transport={TRANSPORT} --cookie-store={state_dir}/cookies.json "
+            f"--url \"$$(cat {url_file})\"{encryption}'")
+
+
 def _unit_text(config=None):
     config = config if isinstance(config, dict) else _load()
     encryption_argument = "" if config.get("ios_compatible", False) else f" --encryption-key-file={KEY_FILE}"
+    exec_start = _exec_start(STATE_DIR / "main", URL_FILE, encryption_argument)
     return f"""[Unit]
 Description=WEB PANEL PROXY OpenFlux exit node
 After=network-online.target
@@ -143,7 +155,7 @@ Type=simple
 User={SERVICE_USER}
 Group={SERVICE_USER}
 UMask=0077
-ExecStart=/bin/sh -c 'exec {BIN} --role=exit --mode={MODE} --codec={CODEC} --transport={TRANSPORT} --url "$$(cat {URL_FILE})"{encryption_argument}'
+ExecStart={exec_start}
 Restart=on-failure
 RestartSec=4
 TimeoutStopSec=15
@@ -400,6 +412,7 @@ def _write_extra_files(config):
 def _extra_unit_text(config):
     paths = _extra_paths(config["id"])
     encryption = "" if config.get("platform") == "ios" else " --encryption-key-file=" + str(paths["key"])
+    exec_start = _exec_start(STATE_DIR / _extra_id(config["id"]), paths["url"], encryption)
     return f"""[Unit]
 Description=WEB PANEL PROXY OpenFlux profile {config['id']}
 After=network-online.target
@@ -411,7 +424,7 @@ Type=simple
 User={SERVICE_USER}
 Group={SERVICE_USER}
 UMask=0077
-ExecStart=/bin/sh -c 'exec {BIN} --role=exit --mode={MODE} --codec={CODEC} --transport={TRANSPORT} --url "$$(cat {paths['url']})"{encryption}'
+ExecStart={exec_start}
 Restart=on-failure
 RestartSec=4
 TimeoutStopSec=15

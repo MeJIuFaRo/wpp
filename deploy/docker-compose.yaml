@@ -28,7 +28,7 @@ x-service: &service
 
 services:
   net:
-    image: mejiufaro/wpp-relay:${WPP_TAG:-2.3.6-2}
+    image: mejiufaro/wpp-relay:${WPP_TAG:-2.3.6-3}
     entrypoint: ["sleep", "infinity"]
     restart: unless-stopped
     init: true
@@ -52,7 +52,7 @@ services:
 
   panel:
     <<: *service
-    image: mejiufaro/wpp-panel:${WPP_TAG:-2.3.6-2}
+    image: mejiufaro/wpp-panel:${WPP_TAG:-2.3.6-3}
     environment:
       WPP_DOMAIN: ${WPP_DOMAIN}
       WPP_ACME_EMAIL: ${WPP_ACME_EMAIL:-}
@@ -102,7 +102,7 @@ services:
 
   relay:
     <<: *service
-    image: mejiufaro/wpp-relay:${WPP_TAG:-2.3.6-2}
+    image: mejiufaro/wpp-relay:${WPP_TAG:-2.3.6-3}
     volumes:
       - ./config/control:/var/lib/wpp-control
       - ./config/relay:/etc/tproxy-server:ro
@@ -110,7 +110,7 @@ services:
 
   backends:
     <<: *service
-    image: mejiufaro/wpp-mtproxy:${WPP_TAG:-2.3.6-2}
+    image: mejiufaro/wpp-mtproxy:${WPP_TAG:-2.3.6-3}
     environment:
       WPP_PUBLIC_IP: ${WPP_PUBLIC_IP:-}
     volumes:
@@ -120,7 +120,7 @@ services:
 
   mtproto:
     <<: *service
-    image: mejiufaro/wpp-mtproxy:${WPP_TAG:-2.3.6-2}
+    image: mejiufaro/wpp-mtproxy:${WPP_TAG:-2.3.6-3}
     environment:
       WPP_AGENT_NAME: mtproto
       WPP_AGENT_PORT: "9103"
@@ -133,7 +133,7 @@ services:
 
   xray:
     <<: *service
-    image: mejiufaro/wpp-xray:${WPP_TAG:-2.3.6-2}
+    image: mejiufaro/wpp-xray:${WPP_TAG:-2.3.6-3}
     volumes:
       - ./config/control:/var/lib/wpp-control
       - ./config/xray:/etc/web-panel-proxy-xray:ro
@@ -141,7 +141,7 @@ services:
 
   openflux:
     <<: *service
-    image: mejiufaro/wpp-openflux:${WPP_TAG:-2.3.6-2}
+    image: mejiufaro/wpp-openflux:${WPP_TAG:-2.3.6-3}
     volumes:
       - ./config/control:/var/lib/wpp-control
       - ./config/units:/etc/systemd/system:ro

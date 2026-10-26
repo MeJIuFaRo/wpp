@@ -25,6 +25,7 @@ build_one() {
         --build-arg TPROXY_REPO="$TPROXY_REPO" --build-arg TPROXY_REF="$TPROXY_REF" \
         --build-arg MTPROXY_COMMIT="$MTPROXY_COMMIT" --build-arg MTPROXY_SHA256="$MTPROXY_SHA256" \
         --build-arg XRAY_VERSION="$XRAY_VERSION" --build-arg XRAY_SHA256="$XRAY_SHA256" \
+        --build-arg OPENFLUX_REPO="$OPENFLUX_REPO" \
         --build-arg OPENFLUX_VERSION="$OPENFLUX_VERSION" --build-arg OPENFLUX_SHA256="$OPENFLUX_SHA256" \
         --build-arg WPP_VERSION="$TAG" --build-arg CADDY_IMAGE="$CADDY_IMAGE" \
         --build-arg RELAY_IMAGE="$NS/wpp-relay:$TAG" --build-arg XRAY_IMAGE="$NS/wpp-xray:$TAG" \

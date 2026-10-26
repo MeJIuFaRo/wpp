@@ -79,10 +79,10 @@ docker compose exec panel web-proxy-panelctl users
 
 ```bash
 scripts/build.sh build          # все образы по очереди
-tests/smoke-relay.sh mejiufaro/wpp-relay:2.3.6-2
-tests/smoke-mtproxy.sh mejiufaro/wpp-mtproxy:2.3.6-2
+tests/smoke-relay.sh mejiufaro/wpp-relay:2.3.6-3
+tests/smoke-mtproxy.sh mejiufaro/wpp-mtproxy:2.3.6-3
 tests/integration.sh            # весь стек без публичного домена
-scripts/build.sh push 2.3.6-2-rc   # проверка на секреты и публикация
+scripts/build.sh push 2.3.6-3-rc   # проверка на секреты и публикация
 ```
 
 Исходники upstream закреплены по коммитам и контрольным суммам в `versions.env`. Доработки — патчи в `src/relay-patches` и `src/mtproxy-patches`; код панели — в `src/panel` (исходное состояние до переноса в Docker — в `reference/2.3.6/panel` для сравнения). Устройство и принятые решения — в [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
