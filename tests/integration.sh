@@ -34,7 +34,7 @@ for unit in tproxy-panel tproxy-server mtproxy; do
     sysd is-active --quiet "$unit" || fail "$unit is not active"
 done
 echo "units active: tproxy-panel tproxy-server mtproxy"
-dc logs panel | grep -q 'Password:' || fail "no first-start banner"
+grep -q 'Password:' <<<"$(dc logs panel 2>&1)" || fail "no first-start banner"
 [[ -s data/panel/initial-admin-password ]] || fail "generated password was not saved"
 grep -q 'max_profiles": 128' config/relay/config.json || fail "relay limit"
 dc exec -T panel caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \

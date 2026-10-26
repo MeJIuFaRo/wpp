@@ -29,7 +29,11 @@ LEGACY_IOS_DROPIN = Path("/etc/systemd/system/web-panel-proxy-openflux.service.d
 PROFILES_DIR = CONFIG_DIR / "profiles"
 VERSION = "0.13.0"
 MAX_OPENFLUX_PROFILES = 32
-TRANSPORT = "yandex"
+TRANSPORT = "yandex"  # default for profiles created before the transport choice
+# Carriers a profile can use: Yandex Docs, or a Yandex Telemost conference
+# (video relayed by the conference server; one conference = one client).
+TRANSPORTS = {"yandex": "Яндекс Документы", "telemost": "Яндекс Телемост"}
+TELEMOST_HOSTS = {"telemost.yandex.ru", "telemost.yandex.com", "telemost.360.yandex.ru", "telemost.360.yandex.com"}
 CODEC = "batched"
 MODE = "l4"
 
@@ -86,6 +90,39 @@ def validate_document_url(value):
     return value
 
 
+def clean_transport(value):
+    value = str(value or TRANSPORT).strip().lower()
+    if value not in TRANSPORTS:
+        raise OpenFluxError("Выберите транспорт: Яндекс Документы или Яндекс Телемост.")
+    return value
+
+
+def transport_of(config):
+    value = config.get("transport") if isinstance(config, dict) else None
+    return value if value in TRANSPORTS else TRANSPORT
+
+
+def validate_telemost_url(value):
+    value = str(value or "").strip()
+    if not value or len(value) > 2048 or any(ord(char) < 32 for char in value):
+        raise OpenFluxError("Укажите ссылку на конференцию Яндекс Телемоста.")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise OpenFluxError("Ссылка на конференцию имеет неверный формат.") from exc
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme != "https" or host not in TELEMOST_HOSTS or port not in (None, 443):
+        raise OpenFluxError("Нужна HTTPS-ссылка Телемоста вида https://telemost.yandex.ru/j/…")
+    if parsed.username or parsed.password or parsed.fragment or not re.fullmatch(r"/j/[A-Za-z0-9_-]{4,128}/?", parsed.path):
+        raise OpenFluxError("Используйте ссылку на конкретную конференцию: https://telemost.yandex.ru/j/…")
+    return value
+
+
+def validate_link(value, transport):
+    return validate_telemost_url(value) if transport == "telemost" else validate_document_url(value)
+
+
 def _load():
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -132,18 +169,18 @@ def _write_private_files(config):
             pass
 
 
-def _exec_start(state_dir, url_file, encryption):
+def _exec_start(state_dir, url_file, encryption, transport):
     # Each profile keeps its own cookie jar; the shell creates the directory
     # and runs the core inside it, so nothing is written elsewhere.
     return (f"/bin/sh -c 'mkdir -p {state_dir} && cd {state_dir} && exec {BIN} --role=exit --mode={MODE} "
-            f"--codec={CODEC} --transport={TRANSPORT} --cookie-store={state_dir}/cookies.json "
+            f"--codec={CODEC} --transport={transport} --cookie-store={state_dir}/cookies.json "
             f"--url \"$$(cat {url_file})\"{encryption}'")
 
 
 def _unit_text(config=None):
     config = config if isinstance(config, dict) else _load()
     encryption_argument = "" if config.get("ios_compatible", False) else f" --encryption-key-file={KEY_FILE}"
-    exec_start = _exec_start(STATE_DIR / "main", URL_FILE, encryption_argument)
+    exec_start = _exec_start(STATE_DIR / "main", URL_FILE, encryption_argument, transport_of(config))
     return f"""[Unit]
 Description=WEB PANEL PROXY OpenFlux exit node
 After=network-online.target
@@ -224,14 +261,15 @@ def _start():
     raise OpenFluxError("OpenFlux не запустился. " + journal.strip()[-900:])
 
 
-def configure(document_url, ios_compatible=False):
-    url = validate_document_url(document_url)
+def configure(document_url, ios_compatible=False, transport=TRANSPORT):
+    transport = clean_transport(transport)
+    url = validate_link(document_url, transport)
     previous = _load()
     config = {
         "enabled": True,
         "url": url,
         "key": previous.get("key") if isinstance(previous.get("key"), str) and len(previous["key"]) >= 24 else secrets.token_urlsafe(32),
-        "transport": TRANSPORT,
+        "transport": transport,
         "codec": CODEC,
         "mode": MODE,
         "ios_compatible": bool(ios_compatible),
@@ -257,7 +295,7 @@ def configure(document_url, ios_compatible=False):
 def set_enabled(enabled):
     config = _load()
     if not config.get("url") or not config.get("key"):
-        raise OpenFluxError("Сначала сохраните ссылку на документ.")
+        raise OpenFluxError("Сначала сохраните ссылку на документ или конференцию.")
     config["enabled"] = bool(enabled)
     config["updated_at"] = int(time.time())
     _write_private_files(config)
@@ -277,7 +315,7 @@ def set_enabled(enabled):
 def rotate_key():
     config = _load()
     if not config.get("url"):
-        raise OpenFluxError("Сначала сохраните ссылку на документ.")
+        raise OpenFluxError("Сначала сохраните ссылку на документ или конференцию.")
     previous = dict(config)
     config["key"] = secrets.token_urlsafe(32)
     config["enabled"] = True
@@ -327,7 +365,7 @@ def state():
         "active": _service_active() if configured else False,
         "url": config.get("url", "") if configured else "",
         "key": config.get("key", "") if configured else "",
-        "transport": TRANSPORT,
+        "transport": transport_of(config),
         "codec": CODEC,
         "mode": MODE,
         "ios_compatible": bool(config.get("ios_compatible", False)),
@@ -412,7 +450,7 @@ def _write_extra_files(config):
 def _extra_unit_text(config):
     paths = _extra_paths(config["id"])
     encryption = "" if config.get("platform") == "ios" else " --encryption-key-file=" + str(paths["key"])
-    exec_start = _exec_start(STATE_DIR / _extra_id(config["id"]), paths["url"], encryption)
+    exec_start = _exec_start(STATE_DIR / _extra_id(config["id"]), paths["url"], encryption, transport_of(config))
     return f"""[Unit]
 Description=WEB PANEL PROXY OpenFlux profile {config['id']}
 After=network-online.target
@@ -496,25 +534,27 @@ def profile_states():
         result.append({
             "id": config["id"], "name": config.get("name", "OpenFlux"),
             "platform": config.get("platform", "android"), "url": config.get("url", ""),
-            "key": config.get("key", ""), "configured": True,
+            "key": config.get("key", ""), "configured": True, "transport": transport_of(config),
             "enabled": bool(config.get("enabled", True)), "active": _extra_active(config["id"]),
             "encrypted": config.get("platform") != "ios", "version": VERSION,
         })
     return result
 
 
-def create_profile(name, document_url, platform):
+def create_profile(name, document_url, platform, transport=TRANSPORT):
     if len(_extra_configs()) >= MAX_OPENFLUX_PROFILES:
         raise OpenFluxError("Достигнут лимит профилей OpenFlux.")
     profile_id = secrets.token_hex(8)
-    document_url = validate_document_url(document_url)
+    transport = clean_transport(transport)
+    document_url = validate_link(document_url, transport)
     existing_urls = {item.get("url") for item in _extra_configs()}
     existing_urls.add(_load().get("url"))
     if document_url in existing_urls:
-        raise OpenFluxError("Этот документ уже используется другим профилем OpenFlux.")
+        # One document or one conference carries exactly one client.
+        raise OpenFluxError("Эта ссылка уже используется другим профилем OpenFlux.")
     config = {"id": profile_id, "name": _clean_profile_name(name),
               "url": document_url, "platform": _clean_platform(platform),
-              "key": secrets.token_urlsafe(32), "enabled": True, "transport": TRANSPORT,
+              "key": secrets.token_urlsafe(32), "enabled": True, "transport": transport,
               "codec": CODEC, "mode": MODE, "version": VERSION,
               "created_at": int(time.time()), "updated_at": int(time.time())}
     _write_extra_files(config)

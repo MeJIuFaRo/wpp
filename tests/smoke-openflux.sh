@@ -3,14 +3,20 @@
 # Yandex document: the core must accept every flag, run unprivileged and keep
 # its state in /var/lib/wpp-openflux/<profile>. A real tunnel needs a real
 # document and a client, see docs/ARCHITECTURE.md.
-#   tests/smoke-openflux.sh IMAGE
+#   tests/smoke-openflux.sh IMAGE [yandex|telemost]
 set -Eeuo pipefail
 image="$1"
+transport="${2:-yandex}"
+case "$transport" in
+    yandex)   doc='https://disk.yandex.ru/i/wpp-smoke-test' ;;
+    telemost) doc='https://telemost.yandex.ru/j/00000000000000' ;;
+    *) echo "unknown transport $transport" >&2; exit 2 ;;
+esac
 dir="$(mktemp -d)"; name="wpp-smoke-openflux-$$"
 trap 'docker rm -f "$name" >/dev/null 2>&1; rm -rf "$dir"' EXIT
 mkdir -p "$dir/control" "$dir/units" "$dir/openflux" "$dir/state"
 head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$dir/control/agent.token"
-echo 'https://disk.yandex.ru/i/wpp-smoke-test' > "$dir/openflux/document-url"
+echo "$doc" > "$dir/openflux/document-url"
 head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$dir/openflux/encryption-key"
 echo enabled > "$dir/openflux/enabled"
 state=/var/lib/wpp-openflux/main
@@ -21,7 +27,7 @@ ConditionPathExists=/etc/web-proxy-panel/openflux/enabled
 
 [Service]
 Type=simple
-ExecStart=/bin/sh -c 'mkdir -p $state && cd $state && exec /opt/web-panel-proxy/openflux/openflux --role=exit --mode=l4 --codec=batched --transport=yandex --cookie-store=$state/cookies.json --url "\$\$(cat /etc/web-proxy-panel/openflux/document-url)" --encryption-key-file=/etc/web-proxy-panel/openflux/encryption-key'
+ExecStart=/bin/sh -c 'mkdir -p $state && cd $state && exec /opt/web-panel-proxy/openflux/openflux --role=exit --mode=l4 --codec=batched --transport=$transport --cookie-store=$state/cookies.json --url "\$\$(cat /etc/web-proxy-panel/openflux/document-url)" --encryption-key-file=/etc/web-proxy-panel/openflux/encryption-key'
 Restart=on-failure
 RestartSec=4
 
@@ -38,6 +44,7 @@ docker run -d --name "$name" --init --read-only --tmpfs /tmp --cap-drop ALL --se
 sleep 12
 logs="$(docker logs "$name" 2>&1)"
 echo "$logs" | grep 'web-panel-proxy-openflux' | tail -8
+echo "$logs" | grep -q "Transport: $transport" || { echo "FAIL: the core did not start with $transport"; exit 1; }
 if echo "$logs" | grep -qiE 'flag provided but not defined|unknown flag|usage of'; then
     echo "FAIL: the core rejected a flag"; exit 1
 fi

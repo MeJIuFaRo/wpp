@@ -817,7 +817,7 @@ class Handler(BaseHTTPRequestHandler):
             operation=form.get("operation","")
             try:
                 if operation=="save":
-                    openflux.configure(form.get("url",""),form.get("ios_compatible","")=="1")
+                    openflux.configure(form.get("url",""),form.get("ios_compatible","")=="1",form.get("transport","yandex"))
                 elif operation=="enable": openflux.set_enabled(True)
                 elif operation=="disable": openflux.set_enabled(False)
                 elif operation=="rotate": openflux.rotate_key()
@@ -831,7 +831,7 @@ class Handler(BaseHTTPRequestHandler):
             operation=form.get("operation","")
             try:
                 if operation=="create":
-                    openflux.create_profile(form.get("name",""),form.get("url",""),form.get("platform",""))
+                    openflux.create_profile(form.get("name",""),form.get("url",""),form.get("platform",""),form.get("transport","yandex"))
                 elif operation=="enable": openflux.profile_set_enabled(form.get("id",""),True)
                 elif operation=="disable": openflux.profile_set_enabled(form.get("id",""),False)
                 elif operation=="rotate": openflux.profile_rotate(form.get("id",""))
