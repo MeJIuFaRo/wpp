@@ -119,8 +119,21 @@ def validate_telemost_url(value):
     return value
 
 
+def is_telemost_link(value):
+    try:
+        host = (urlsplit(str(value or "").strip()).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return host in TELEMOST_HOSTS
+
+
 def validate_link(value, transport):
-    return validate_telemost_url(value) if transport == "telemost" else validate_document_url(value)
+    """Return (url, transport). A Telemost conference link always selects the
+    Telemost transport: the Docs check accepts any Yandex address, and a
+    conference link started as a Docs carrier never joins the conference."""
+    if transport == "telemost" or is_telemost_link(value):
+        return validate_telemost_url(value), "telemost"
+    return validate_document_url(value), transport
 
 
 def _load():
@@ -262,8 +275,7 @@ def _start():
 
 
 def configure(document_url, ios_compatible=False, transport=TRANSPORT):
-    transport = clean_transport(transport)
-    url = validate_link(document_url, transport)
+    url, transport = validate_link(document_url, clean_transport(transport))
     previous = _load()
     config = {
         "enabled": True,
@@ -545,8 +557,7 @@ def create_profile(name, document_url, platform, transport=TRANSPORT):
     if len(_extra_configs()) >= MAX_OPENFLUX_PROFILES:
         raise OpenFluxError("Достигнут лимит профилей OpenFlux.")
     profile_id = secrets.token_hex(8)
-    transport = clean_transport(transport)
-    document_url = validate_link(document_url, transport)
+    document_url, transport = validate_link(document_url, clean_transport(transport))
     existing_urls = {item.get("url") for item in _extra_configs()}
     existing_urls.add(_load().get("url"))
     if document_url in existing_urls:
